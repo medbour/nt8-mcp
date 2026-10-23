@@ -297,11 +297,18 @@ not string reflection:
 
 ## Compromises
 
-**`POST /chart/{id}/reload`** — NT8 has no public "reload NinjaScript" method. `ChartControl` only
-has the private `MenuItem mnuReloadNinjaScript` (the right-click entry) and the public
-`OnReloadNinjaScriptHotKey(object, KeyEventArgs)`. The handler raises `Click` on that private menu
-item — one reflection call, clearly commented — and falls back to the public hot-key handler if the
-field is missing in a future build. Both are the real menu path; nothing is reimplemented.
+**`POST /chart/{id}/reload`** — NT8 has no public "reload NinjaScript" method, but it has the public
+`RoutedCommand` `ChartCommands.ReloadNinjaScript` (handler `ChartCommands.ReloadNinjaScriptExecuted`)
+that the right-click entry is bound to. Up to 2026-10 the handler raised `Click` on the private
+`MenuItem mnuReloadNinjaScript`: that answered ok and did nothing (8.1.8.4), because a
+command-bound `MenuItem` runs its `Command` from `OnClick`, and a raised `ClickEvent` only reaches
+`Click` handlers. The public `ChartControl.OnReloadNinjaScriptHotKey` is no fallback either: its IL
+is a single `ret`. The handler now executes the menu item's own `Command` (else
+`ChartCommands.ReloadNinjaScript`) with `RoutedCommand.Execute(param, target)`, target = the
+`ChartControl`, then the chart window, whichever `CanExecute`; and it watches the chart's script
+instances for ~10 s, so `reloaded` is an observation, never a bare ok. Verified live 2026-10-22
+(8.1.8.4): `via` "menu item Command -> ChartControl", an SMA went `Finalized` -> new instance in
+`Historical`.
 
 **`GET /output/window`** (this was `GET /output` up to 1.1; same code, same JSON, moved into
 `Route_Charts` so `GET /output` is free for the events module's ring — see "Precedence" above for the

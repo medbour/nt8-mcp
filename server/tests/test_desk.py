@@ -42,19 +42,34 @@ class Desk:
         refusal = self.check(verb, body)
         if refusal:
             return refusal
+        row = self.rows.get(body.get("strategyId"))
+        if verb == "gridDisable" and not (row["enabled"] or row["alive"]):
+            return {"ok": True, "dryRun": False, "alreadyDisabled": True, "before": self.state(row)}
         plan = f"desk.{verb}|{json.dumps(body.get('strategyId') or body.get('instrument'))}"
         if "confirm" not in body:
-            return {"dryRun": True, "plan": {"verb": verb}, "confirm": "sig:" + plan, "issuedAt": 1.0}
+            issued = time.time() if verb == "gridDisable" else 1.0
+            return {"dryRun": True, "plan": {"verb": verb, "before": self.state(row) if row else None},
+                    "confirm": "sig:" + plan, "issuedAt": issued}
         if body["confirm"] != "sig:" + plan:
             return 409, {"error": "confirm does not match the plan as it is NOW"}
+        if verb == "gridDisable" and not 0 <= time.time() - body.get("issuedAt", 0) <= 30:
+            return 409, {"error": "the confirm is older than 30 s — run the dry run again"}
         if body["confirm"] in self.used:
             return 409, {"error": "this confirm was already used"}
         self.used.add(body["confirm"])
         self.acted.append((verb, body))
-        row = self.rows.get(body.get("strategyId"))
         if verb == "gridEnable" and not row.get("stall"):
             row["enabled"] = row["alive"] = True
+        if verb == "gridDisable":
+            before = self.state(row)
+            row["enabled"] = row["alive"] = False
+            return {"ok": True, "dryRun": False, "alreadyDisabled": False, "before": before, "after": self.state(row)}
         return {"ok": True, "dryRun": False}
+
+    @staticmethod
+    def state(row):
+        return {"enabled": row["enabled"], "state": "Realtime" if row["alive"] else "Terminated",
+                "position": {"side": None, "quantity": 0}, "flat": True, "workingOrders": []}
 
     def check(self, verb, body):
         if verb == "cancelOrphans":
@@ -68,6 +83,9 @@ class Desk:
             if row["enabled"] or row["alive"]:
                 return 409, {"error": "row is enabled or its instance is alive"}
             return None
+        if verb == "gridDisable":
+            in_list = (row["strategy"], row["account"], row["instrument"]) in self.allow
+            return None if in_list else (403, {"error": "is not in the allowlist"})
         if row["enabled"] or row["alive"]:
             return 409, {"error": "row is already enabled or alive"}
         if (row["strategy"], row["account"], row["instrument"]) not in self.allow:
@@ -81,7 +99,7 @@ class Desk:
 
 def _fake(desk):
     fake = FakeAddon()
-    for verb in ("cancelOrphans", "gridRemove", "gridEnable"):
+    for verb in ("cancelOrphans", "gridRemove", "gridEnable", "gridDisable"):
         fake.register("/desk/" + verb, "POST", desk.handle)
     fake.register("/strategies/running", "GET", lambda req: {"strategies": [
         _grid_row(rid, r["enabled"], "Realtime" if r["alive"] and not r.get("stall") else
@@ -143,7 +161,8 @@ def test_writes_refused_without_the_lock_and_nothing_is_sent():
     for holder, ttl in ((None, 0), ("someone-else", 600), (ME, -5)):
         with _Env(lock_holder=holder, lock_ttl=ttl), _fake(desk) as fake:
             for tool, kw in ((nt8.nt_cancel_orphans, {}), (nt8.nt_grid_remove, {"strategy_id": "402010159"}),
-                             (nt8.nt_grid_enable, {"strategy_id": "402010159"})):
+                             (nt8.nt_grid_enable, {"strategy_id": "402010159"}),
+                             (nt8.nt_grid_disable, {"strategy_id": "402010159"})):
                 out = tool(caller=ME, account=SIM, **kw)
                 assert "lock" in out["error"], out
             assert sum(fake.calls.values()) == 0
@@ -248,6 +267,91 @@ def test_grid_enable_refusals():
         rows["2"]["enabled"] = False
         assert "allowlist" in nt8.nt_grid_enable(caller=ME, strategy_id="1", account=SIM)["error"]
     assert desk.acted == []
+
+
+# ── nt_grid_disable ─────────────────────────────────────────────────────────
+
+ALLOW_A = {("StratA", SIM, "ES 12-26")}
+
+
+def test_grid_disable_dry_run_then_confirm():
+    desk = Desk(rows={"1": _row(enabled=True, alive=True)}, allow=ALLOW_A)
+    with _Env(), _fake(desk):
+        dry, done = _two_step(nt8.nt_grid_disable, caller=ME, strategy_id=1, account=SIM)
+    assert dry["plan"]["before"]["enabled"] is True and desk.acted[0][1]["strategyId"] == "1"
+    assert done["ok"] is True and done["alreadyDisabled"] is False
+    assert done["before"]["state"] == "Realtime" and done["after"] == {
+        "enabled": False, "state": "Terminated", "position": {"side": None, "quantity": 0}, "flat": True,
+        "workingOrders": []}
+    assert desk.rows["1"]["enabled"] is False and "1" in desk.rows        # disabled, never removed
+
+
+def test_grid_disable_already_disabled_does_nothing():
+    desk = Desk(rows={"1": _row()}, allow=ALLOW_A)
+    with _Env(), _fake(desk):
+        out = nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM)
+    assert out["ok"] is True and out["alreadyDisabled"] is True and "confirm" not in out
+    assert desk.acted == []
+
+
+def test_grid_disable_refusals():
+    desk = Desk(rows={"1": _row(enabled=True, alive=True)}, allow=set())
+    with _Env(), _fake(desk):
+        assert "allowlist" in nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM)["error"]
+        desk.allow = ALLOW_A
+        assert "no Strategies-grid row" in nt8.nt_grid_disable(caller=ME, strategy_id="9", account=SIM)["error"]
+        assert "not a Provider.Simulator" in nt8.nt_grid_disable(caller=ME, strategy_id="1", account=LIVE)["error"]
+        dry = nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM)
+        stale = nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM, confirm=dry["confirm"],
+                                    issued_at=dry["issuedAt"] - 60)
+        assert "older than 30 s" in stale["error"]
+        assert "does not match" in nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM,
+                                                        confirm="sig:x", issued_at=dry["issuedAt"])["error"]
+        done = nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM, confirm=dry["confirm"],
+                                   issued_at=dry["issuedAt"])
+        assert done["ok"] is True
+        desk.rows["1"]["enabled"] = True
+        again = nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM, confirm=dry["confirm"],
+                                    issued_at=dry["issuedAt"])
+        assert "already used" in again["error"]
+    assert len(desk.acted) == 1
+
+
+def test_grid_disable_needs_lock_and_allowlist_file():
+    desk = Desk(rows={"1": _row(enabled=True, alive=True)}, allow=ALLOW_A)
+    with _Env(legs=False), _fake(desk) as fake:
+        assert "no allowlist file" in nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM)["error"]
+        assert sum(fake.calls.values()) == 0
+    for holder, ttl in ((None, 0), ("someone-else", 600), (ME, -5)):
+        with _Env(lock_holder=holder, lock_ttl=ttl), _fake(desk) as fake:
+            assert "lock" in nt8.nt_grid_disable(caller=ME, strategy_id="1", account=SIM)["error"]
+            assert "lock" in nt8.nt_grid_disable_all(caller=ME, ids=["1"])["error"]
+            assert sum(fake.calls.values()) == 0
+
+
+def test_grid_disable_all_one_confirm_then_per_row_confirms():
+    desk = Desk(rows={"1": _row(enabled=True, alive=True), "2": _row(strategy="StratB", enabled=True, alive=True),
+                      "3": _row(instrument="NQ 12-26"), "4": _row(instrument="NQ 12-26", enabled=True)},
+                allow={("StratA", SIM, "ES 12-26"), ("StratA", SIM, "NQ 12-26")})
+    ids = ["1", "2", "3", "4", "9"]
+    with _Env(), _fake(desk) as fake:
+        dry = nt8.nt_grid_disable_all(caller=ME, ids=ids)
+        assert desk.acted == [] and dry["planned"] == 2
+        assert [(r["strategyId"], r["status"]) for r in dry["rows"]] == \
+            [("1", "planned"), ("2", "refused"), ("3", "off"), ("4", "planned"), ("9", "refused")]
+        assert "allowlist" in dry["rows"][1]["reason"]
+        bogus = nt8.nt_grid_disable_all(caller=ME, ids=ids, confirm="disableAll:00", issued_at=dry["issuedAt"])
+        assert "does not match" in bogus["error"]
+        old = nt8.nt_grid_disable_all(caller=ME, ids=ids, confirm=dry["confirm"], issued_at=dry["issuedAt"] - 60)
+        assert "older than" in old["error"] and desk.acted == []
+        done = nt8.nt_grid_disable_all(caller=ME, ids=ids, confirm=dry["confirm"], issued_at=dry["issuedAt"])
+        assert done["ok"] is True
+        assert [(r["strategyId"], r["result"]) for r in done["rows"]] == [("1", "disabled"), ("4", "disabled")]
+        assert [b["strategyId"] for v, b in desk.acted] == ["1", "4"]
+        assert all("confirm" in b for v, b in desk.acted)                   # each row its own AddOn confirm
+        assert {"1", "2", "3", "4"} <= set(desk.rows) and fake.calls[("POST", "/desk/gridRemove")] == 0
+        again = nt8.nt_grid_disable_all(caller=ME, ids=ids, confirm=dry["confirm"], issued_at=dry["issuedAt"])
+        assert "already used" in again["error"]
 
 
 # ── nt_desk_status ──────────────────────────────────────────────────────────
@@ -506,10 +610,38 @@ def test_desk_status_silent_legs():
                                   "fileError": "missing"}]
 
 
+def test_decisions_days_counts_dates_not_lines():
+    with _Env(legs=[dict(LEG_A, decision_time="09:35")]) as env:
+        _decisions(env, f"StratA_{SIM}.csv",
+                   "date_et,time_et,decision,reason,inputs\r\n"
+                   "2026-09-28,09:35,SKIP,no label,\r\n"
+                   "2026-09-29,09:35,ARMED,limit,\r\n"
+                   "2026-09-29,10:02,ENTER_LONG,filled,\r\n"
+                   "2026-09-30,09:35,ARMED,limit,\r\n"
+                   "2026-09-30,09:50,ENTER_SHORT,filled,\r\n")
+        out = _frozen(WED_10, lambda: nt8.nt_leg_decisions(days=2))
+    leg = out["legs"][0]
+    assert [l["date_et"] for l in leg["lines"]] == ["2026-09-29"] * 2 + ["2026-09-30"] * 2
+    assert leg["noLineToday"] is False
+
+
+def test_decisions_evening_leg_session_days():
+    legs = [dict(LEG_A, decision_time="18:15")]
+    with _Env(legs=legs) as env:
+        _decisions(env, f"StratA_{SIM}.csv", "date_et,time_et,decision,reason,inputs\r\n2026-09-28,18:01,ARMED,x,\r\n")
+        fri = _frozen(datetime(2026, 10, 2, 18, 15), lambda: nt8.nt_leg_decisions())        # no Friday evening session
+        sat = _frozen(datetime(2026, 10, 3, 18, 15), lambda: nt8.nt_leg_decisions())
+        sun_early = _frozen(datetime(2026, 10, 4, 12, 0), lambda: nt8.nt_leg_decisions())
+        sun = _frozen(datetime(2026, 10, 4, 18, 15), lambda: nt8.nt_leg_decisions())        # Globex open: alarm
+        thu = _frozen(datetime(2026, 10, 1, 18, 15), lambda: nt8.nt_leg_decisions())
+    assert [o["legs"][0]["noLineToday"] for o in (fri, sat, sun_early, sun, thu)] == [False, False, False, True, True]
+    assert fri["silentLegs"] == [] and sun["silentLegs"] == [f"StratA/{SIM}"]
+
+
 def test_tools_registered():
     names = {t.name for t in nt8.mcp._tool_manager.list_tools()} if hasattr(nt8.mcp, "_tool_manager") else None
     for name in ("nt_lock", "nt_cancel_orphans", "nt_grid_remove", "nt_grid_enable", "nt_desk_status",
-                 "nt_crash_report", "nt_desk_recover", "nt_leg_decisions"):
+                 "nt_grid_disable", "nt_grid_disable_all", "nt_crash_report", "nt_desk_recover", "nt_leg_decisions"):
         assert hasattr(nt8, name)
         if names is not None:
             assert name in names

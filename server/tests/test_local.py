@@ -222,6 +222,36 @@ def test_nt_install_addon_refuses_a_misrouted_file():
     assert result["ok"] is False and "NT8Bridge.cs" in result["error"], result
 
 
+def test_nt_install_require_pushed_is_opt_in():
+    # Off by default: a file outside git installs. With NT8_MCP_REQUIRE_PUSHED=1 it is refused, nothing copied.
+    run = tempfile.mkdtemp(prefix="ntpushed_")
+    custom = os.path.join(run, "Custom")
+    for folder in nt8._SCRIPT_FOLDERS:
+        os.makedirs(os.path.join(custom, folder))
+    src = os.path.join(run, "NT8Bridge.cs")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(PARTIAL_ADDON)
+
+    saved = (tools_local.NT_CUSTOM, tools_local.time, os.environ.get("NT8_MCP_REQUIRE_PUSHED"))
+    tools_local.NT_CUSTOM, tools_local.time = custom, _NO_SLEEP
+    try:
+        os.environ.pop("NT8_MCP_REQUIRE_PUSHED", None)
+        assert nt8.nt_install([src])[0]["action"] == "copied"
+        os.remove(os.path.join(custom, "AddOns", "NT8Bridge.cs"))
+        os.environ["NT8_MCP_REQUIRE_PUSHED"] = "1"
+        refused = nt8.nt_install([src])
+    finally:
+        tools_local.NT_CUSTOM, tools_local.time = saved[0], saved[1]
+        if saved[2] is None:
+            os.environ.pop("NT8_MCP_REQUIRE_PUSHED", None)
+        else:
+            os.environ["NT8_MCP_REQUIRE_PUSHED"] = saved[2]
+        exists = os.path.exists(os.path.join(custom, "AddOns", "NT8Bridge.cs"))
+        shutil.rmtree(run, ignore_errors=True)
+
+    assert "not in a git repo" in refused[0]["problems"][0] and not exists, refused
+
+
 def _png(name: str) -> str:
     path = os.path.join(tempfile.gettempdir(), name)
     with open(path, "wb") as fh:

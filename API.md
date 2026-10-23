@@ -16,6 +16,8 @@ seek/speed/run driver (see
 other module's gate chain. Outside these, writes are limited to `reload`, `screenshot`, chart
 control (`indicator/add`, `indicator/remove`, `series`, `scroll` — no arming file, no account
 touched, see [Chart control](#chart-control-module-chartcontrol-addonnt8bridgechartcontrolcs)),
+the workspace operations (`workspace/switch`, `open`, `close`, `saveAs` — see
+[Workspace module](#workspace-module-addonnt8bridgeworkspacecs)),
 `compile`/`compile?reload=1`, and the opt-in, flag-gated `data/download`.
 
 All responses are JSON, UTF-8. Errors: HTTP 4xx/5xx with `{"error":"message"}`.
@@ -48,6 +50,7 @@ method directly (`addon/NT8Bridge.cs`): it matches exactly `health`, `windows`, 
 | `NT8Bridge.Account.cs` | `Route_Account` | `/account`, `/executions`, `/performance` |
 | `NT8Bridge.Backtest.cs` | `Route_Backtest` | `/strategies`, `/templates`, `/backtest`, `/backtests`, `/backtest/{id}` |
 | `NT8Bridge.Compile.cs` | `Route_Compile` | `/compile`, `/compile?reload=1` |
+| `NT8Bridge.Editor.cs` | `Route_Editor` | `/editor/open` |
 | `NT8Bridge.Events.cs` | `Route_Events` | `/output`, `/nt-log` |
 | `NT8Bridge.Feeds.cs` | `Route_Feeds` | `/feedhealth`, `/connections` |
 | `NT8Bridge.Data.cs` | `Route_Data` | `/data/coverage`, `/data/download[/{id}]` |
@@ -87,7 +90,7 @@ accepts `first` (the first chart found).
 ### `GET /health`
 
 ```json
-{ "ok": true, "addonVersion": "1.5.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
+{ "ok": true, "addonVersion": "1.6.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
   "connections": [{"name":"Sim101 feed","status":"Connected","provider":"Simulator","canManageOrders":false}],
   "charts": 1, "anyLive": false, "anyNonSim": true, "standingModal": null,
   "pid": 12345, "processStartUtc": "2026-09-18T08:59:50Z",
@@ -144,7 +147,7 @@ Unchanged from v1.1 except as noted; the output-window scrape moved here from th
 | GET | `/chart/{id}/bars?n=50` | `[{"time":t,"o":..,"h":..,"l":..,"c":..,"v":..}]` last n bars of the primary series, oldest first |
 | GET | `/chart/{id}/indicators?name=EMA&n=20` | see below. `name` optional (substring, case-insensitive), `n` = values per plot (default 1) |
 | GET | `/chart/{id}/drawings` | `[{"tag":"..","type":"Line"\|"Ray"\|"Rectangle"\|"Text"\|..,"owner":"MyStrategy"\|"user","anchors":[{"time":t,"price":p}],"text":".."}]` |
-| POST | `/chart/{id}/reload` | `{"ok":true}` — same as right-click, Reload NinjaScript, for **this chart's own NinjaScript instances only** (not the assembly — that is `/compile?reload=1`) |
+| POST | `/chart/{id}/reload` | `{"ok":true,"reloaded":true\|false\|null,"via":..,"settled":..,"statesSeen":[..],"before":[{name,state}],"after":[{name,state,newInstance}],"note":..,"standingModal":..}` — NinjaTrader's own Reload NinjaScript command (`ChartCommands.ReloadNinjaScript`, a `RoutedCommand`, executed on the chart's thread with the `ChartControl` as target; no menu) for **this chart's own NinjaScript instances only** (not the assembly — that is `/compile?reload=1`). `reloaded` is what was OBSERVED over ~10 s: an instance replaced or its state changed; `null` when the chart has no NinjaScript. `409` while a modal is open, when the chart has an enabled strategy (a reload restarts it), or when the command cannot execute |
 | POST | `/chart/{id}/screenshot` body `{"path":"C:/x.png"}` (optional) | `{"ok":true,"path":..,"width":..,"height":..}` PNG of the chart's **canvas** via `RenderTargetBitmap`; default path `%TEMP%/nt8bridge/c1.png`. For the chart's whole window (frame, toolbar, Chart Trader included) use `POST /screenshot` in the [workspace module](#workspace-module-addonnt8bridgeworkspacecs) instead |
 | GET | `/output/window?n=200` | scrape of the NinjaScript Output **window's** visual tree; `{"lines":[..]}`, or `{"lines":[],"note":"Output window not open"}`. This is the pre-1.2 `/output` behaviour, kept as the fallback for lines printed **before** the ring (`GET /output`, events module) started — see `docs/api/events.md` |
 
@@ -361,6 +364,7 @@ NinjaScript Editor window is needed, and a failure comes back as
 |---|---|---|
 | POST | `/compile` | check-only: validates the tree, emits nothing, `assemblyReloaded` always `false` |
 | POST | `/compile?reload=1` body `{"force":false}` | the same result, but NinjaTrader emits and **swaps** the assembly exactly as F5 does. `409` while `AnyLiveConnected()` unless `{"force":true}` |
+| POST | `/editor/open` | `{"ok":true,"alreadyOpen":bool,"windowTitle":..}` — opens the NinjaScript Editor as Control Center > New > NinjaScript Editor does (`NT8Bridge.Editor.cs`); does nothing if one is open. No compile, save or close. `503` no Control Center / handler unresolved, `504` no editor window seen within 10 s |
 
 `GET /compile` is not handled (core 404). Both forms take an optional JSON body; send
 `Content-Length: 0` for an empty one (`HttpListener` answers 411 without it). The compiler
@@ -409,6 +413,7 @@ build.
 | `nt_compile(timeout_s=120)` | `POST /compile` (check-only) via `compile_via_addon(reload=False)`. If the AddOn does not answer at all (not merely slow), falls back by itself to `nt_compile_f5` and says so in `fallback` |
 | `nt_reload_assembly(timeout_s=240)` | `POST /compile?reload=1` via `compile_via_addon(reload=True)`. **A separate tool, never a flag on `nt_compile`**, so a validate step cannot disrupt a live session by accident. Refused by the AddOn with 409 while `AnyLiveConnected()`; there is no `force` override exposed here |
 | `nt_compile_f5(timeout_s=240)` | the pre-1.2 cold-start path: press F5 in an open NinjaScript Editor window and wait for the dll to change. Kept as the fallback for when the AddOn is not loaded at all — a real compile, not a check |
+| `nt_editor_open()` | `POST /editor/open`: opens the NinjaScript Editor so `nt_compile_f5` has a window to press F5 in. Changes nothing else |
 
 > **Design note:** `nt_reload_assembly` exposes **no** `force` override — the AddOn's 409 while a
 > live order-routing connection is up cannot be bypassed from the MCP surface at all (the AddOn's
@@ -661,12 +666,17 @@ overwritten by the reconstruction.
 
 ## Workspace module (`addon/NT8Bridge.Workspace.cs`)
 
-Read only, with one exception that is not a NinjaTrader state change: `POST /screenshot` writes
-one PNG to a path the caller chose. Nothing here enables, disables, starts or stops a strategy,
-and nothing restores, fronts, moves or resizes a window.
+Read only, with two exceptions: `POST /screenshot` writes one PNG to a path the caller chose, and
+`POST /workspace/{switch,open,close,saveAs}` change which workspaces are open and active. Nothing
+here enables, disables, starts or stops a strategy, and nothing restores, fronts, moves or
+resizes a window by itself.
 
 | Method | Path | Returns |
 |---|---|---|
+| POST | `/workspace/switch` body `{"name"}` | `WorkspaceOptions.SwitchToWorkspace(name)`; the workspace must be open (else `409`) |
+| POST | `/workspace/open` body `{"name","activate":true}` | `WorkspaceOptions.OpenWorkspace(name, activate)` on `<WorkspacesFolderPath>/<name>.xml`, also a file the Workspaces menu does not list yet (`404` no file). Already open: a switch when `activate`, else nothing |
+| POST | `/workspace/close` body `{"name","save":false}` | `WorkspaceOptions.CloseWorkspace(name, hideOnly:false, removing:false, isActive)`, queued with `BeginInvoke`. Its own "Save Workspace" prompt for this workspace is answered in-process (button automation peer `Invoke`): **No** for `save:false`, **Yes** for `save:true`; `prompt` = `"answered No"` / `"answered Yes"` / `"none"`. Cancel and other dialogs are never touched. **Never `removing:true`** (that deletes the file). `409` for the only open workspace and for one whose Strategies-grid rows (`Workspace` column) hold an enabled or running strategy; `503` when the grid cannot be read; `504` + `standingModal` when the prompt is not found or answered in ~10 s (left for the user) |
+| POST | `/workspace/saveAs` body `{"name","newName","overwrite":false}` | `WorkspaceOptions.SaveWorkspaceAs(name, newName, isActive, isNew:false)` on an open workspace. **Renames the open workspace** like the menu's Save As: `newName` is open afterwards, `name` is not (`renamed:true`; `name.xml` stays). `409` when `newName.xml` exists without `overwrite:true`, or `newName` is open |
 | GET | `/workspace` | `{"name":"Trading","windows":[…]}` — active workspace + every window (geometry + one `details` object per chart) |
 | GET | `/strategies/running?materialize=1` | `{"gridResolved":true,"strategies":[…],"notes":[]}` — the Control Center Strategies grid |
 | POST | `/screenshot` body `{"window"\|"chart"\|"hwnd","path"}` | `{"ok":true,"path":..,"window":..,"hwnd":..,"width":..,"height":..,"bytes":..,"method":..,"composited":..,"looksBlank":false}` |
@@ -692,8 +702,18 @@ occluded window occluded — the truth, not a defect); `composited:true` merges 
 the WinForms `Direct2DForm` that actually draws a NinjaTrader chart's canvas. `looksBlank` (PNG
 under 8 KB) is a hint to go look at the image, never a verdict.
 
+`POST /workspace/*`: no menu, no mouse, no keys; the one dialog NinjaTrader raises (close's save
+prompt) is answered inside the process. Each call runs on the Control Center's own
+dispatcher (the thread its Workspaces menu uses). `name`/`newName` are file names without `.xml`:
+a path, a separator or `_Workspaces` is a `400`. Refused (`409`, `standingModal`) while a modal
+message box is open. The answer is the READ-BACK after the call, re-read for up to ~5 s:
+`{ok, observed, op, name, …, active, open, standingModal}`; `ok` equals `observed` (the active
+name / open list / written file shows the change), `returned` is NinjaTrader's own bool. A
+refusal is `{ok:false, error, active, open, standingModal}`. Details: `docs/api/workspace.md`.
+
 **MCP:** `nt_workspace()`, `nt_strategies_running(materialize)`, `nt_window_shot(window, chart,
-hwnd, path)`.
+hwnd, path)`, `nt_workspace_switch(name)`, `nt_workspace_open(name, activate)`,
+`nt_workspace_close(name, save)`, `nt_workspace_save_as(name, new_name, overwrite)`.
 
 ---
 
@@ -1030,6 +1050,7 @@ Transition or Realtime. Full contract: `docs/api/desk.md`.
 | POST | `/desk/cancelOrphans` | `{account, instrument?, confirm?, issuedAt?}` | cancel every orphan in one `Account.Cancel`; `ownerUnknown` orders are never cancelled |
 | POST | `/desk/gridRemove` | `{account, strategyId, confirm?, issuedAt?}` | `StrategiesGrid.StrategyRemove` on a row that is disabled, dead, on `account`, and not started by this AddOn |
 | POST | `/desk/gridEnable` | `{account, strategyId, confirm?, issuedAt?}` | `StrategiesGrid.StrategyEnable` on an existing row, only when it is in `desk_legs.json` and no other row/instance of the same (strategy, account) is enabled or alive |
+| POST | `/desk/gridDisable` | `{account, strategyId, confirm?, issuedAt?}` | `StrategiesGrid.StrategyDisable` on an existing row, only when it is in `desk_legs.json`. KEEPS the row (no remove), no flatten, no cancel of its own. Already off = `{ok:true, alreadyDisabled:true}`, nothing dispatched. Answer has `before` / `after`: `enabled`, `state`, `position`, `flat`, `workingOrders` |
 
 `strategyId` is sent as a string (a long does not survive a double). Refusals: `noAllowlist` /
 `notAllowlisted` (403), `alreadyEnabled` / `rowEnabled` / `duplicate` / `bridgeRun` /
@@ -1040,15 +1061,17 @@ Also new on existing endpoints: `GET /strategies/running` rows carry `strategyId
 the `/orders/cancel` plan carry `owner` ("strategy <name> #<id> alive|dead" for a strategy),
 `ownerStrategyId`, `ownerState`, `ownerAlive`.
 
-**MCP (Python side)**: `nt_cancel_orphans`, `nt_grid_remove`, `nt_grid_enable` and
-`nt_desk_recover` also require the local lock file (`nt_lock`); `nt_desk_status`, `nt_crash_report`
+**MCP (Python side)**: `nt_cancel_orphans`, `nt_grid_remove`, `nt_grid_enable`,
+`nt_grid_disable`, `nt_grid_disable_all` and `nt_desk_recover` also require the local lock file (`nt_lock`); `nt_desk_status`, `nt_crash_report`
 and `nt_leg_decisions` are read-only (the crash report reads the NinjaTrader log/trace folders and
 the Windows event log, no AddOn; `nt_leg_decisions` reads the per-leg files
 `nt8mcp\decisions\<strategy>_<account>.csv`, `NT8MCP_DECISIONS_DIR` overrides the folder).
 `nt_desk_recover` has no AddOn path of its own: it re-enables every allowlisted leg that is off
 through `/desk/gridEnable`, one AddOn dry run + confirm per row, under one MCP-signed one-shot
 confirm; a leg with 0 or more than 1 disabled, dead row is refused. `desk_legs.json` legs may carry
-an optional `"decision_time": "HH:MM"` (ET) for the silent-leg flag.
+an optional `"decision_time": "HH:MM"` (ET) for the silent-leg flag. `nt_grid_disable_all` has no
+AddOn path of its own either: one MCP-signed one-shot confirm over a list of strategyIds, then one
+`/desk/gridDisable` dry run + AddOn confirm per row.
 
 ---
 

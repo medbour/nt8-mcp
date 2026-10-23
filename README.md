@@ -58,7 +58,7 @@ Needs Windows, NinjaTrader 8 (a free Simulator install is enough) and Python 3.1
                  |  MCP
                  v
 +----------------------------------------------------------+
-|  nt8-mcp  (Python MCP server: 89 tools + the nt8 CLI)    |
+|  nt8-mcp  (Python MCP server: 96 tools + the nt8 CLI)    |
 +----------------------------------------------------------+
                  |  HTTP on localhost:7891
                  v
@@ -305,7 +305,7 @@ AddOn passthroughs (need NT8 open with the AddOn compiled in), grouped by the mo
 | `nt_bars(chart, n=50)` | Last n OHLCV bars |
 | `nt_indicators(chart, name="", n=1)` | Indicators, their inputs, last n plot values |
 | `nt_drawings(chart)` | Drawing objects on the chart |
-| `nt_chart_reload(chart)` | Reload NinjaScript on the chart (not the assembly — that's `nt_reload_assembly`) |
+| `nt_chart_reload(chart)` | Reload NinjaScript on the chart (not the assembly — that's `nt_reload_assembly`). Runs NinjaTrader's own Reload NinjaScript command, no menu; returns `reloaded` as observed (instances replaced or state changed), `before` / `after` |
 | `nt_account(name="")` | Read-only account state (cash, P&L, positions, orders, each order's owning strategy id and alive/dead); no name = all accounts |
 | `nt_bridge_log(n=100)` | Tail of the AddOn's own request/error log |
 | `nt_screenshot(chart="first")` | PNG of the chart window |
@@ -334,6 +334,7 @@ None of these touch an account or need an arming file. `nt_chart_indicator_add` 
 | `nt_compile(timeout_s=120)` | Compiles the whole `bin\Custom` tree through NinjaTrader's own compiler with no Editor window open; structured `{file,line,column,code,message}` |
 | `nt_reload_assembly(timeout_s=240)` | Compiles for real **and** swaps the running assembly (`POST /compile?reload=1`) so new/changed types are available immediately instead of waiting for NT8's own 20-150 s folder watcher. Disruptive; separate tool on purpose, never a flag on `nt_compile`. Refuses while a live order-routing connection is up; the tool cannot override that (no `force` argument is exposed) |
 | `nt_compile_f5(timeout_s=240)` | Cold-start fallback: press F5 in the NinjaScript Editor and wait for `NinjaTrader.Custom.dll` to be rebuilt. Kept as a fallback even after `nt_compile`/`nt_reload_assembly` landed |
+| `nt_editor_open()` | Opens the NinjaScript Editor window (`POST /editor/open`), as Control Center > New > NinjaScript Editor does, so `nt_compile_f5` can run. Does nothing if one is open; compiles, saves and closes nothing. Returns `{ok, alreadyOpen, windowTitle}` |
 
 ### Output / log
 
@@ -455,6 +456,14 @@ To use the downloaded tick and minute data in Python, export it offline to Parqu
 | `nt_workspace()` | Every window the AddOn can see, with each chart's indicators/strategies and their `State` |
 | `nt_strategies_running(materialize=False)` | The Control Center's Strategies grid — a strategy population no chart walk can see. `materialize=True` forces the tab into view and restores the user's tab afterwards |
 | `nt_window_shot(window="", chart="", hwnd=0, path="")` | PNG of any NT8 window, captured in-process with `PrintWindow` — never fronts or restores it |
+| `nt_workspace_switch(name)` | Make an open workspace the active one |
+| `nt_workspace_open(name, activate=True)` | Open a workspace file from NT8's workspaces folder, also one the Workspaces menu does not list yet |
+| `nt_workspace_close(name, save=False)` | Close an open workspace with no click needed: the AddOn answers NT8's own save prompt inside NT8 (No, or Yes for `save=True`). Never deletes the file. Refused for the only open workspace and for one holding an enabled or running strategy |
+| `nt_workspace_save_as(name, new_name, overwrite=False)` | Save an open workspace under a new name with no dialog; an existing file needs `overwrite=True`. Like NT8's Save As, it renames the open workspace |
+
+The four workspace tools call NinjaTrader's own `WorkspaceOptions` methods inside the AddOn, on
+the Control Center's thread: no menu, no dialog, no mouse. Each one answers with what it read
+back afterwards (`active`, `open`, `observed`) and refuses while a modal message box is open.
 
 ### Playback
 
@@ -569,19 +578,21 @@ dry run, then a signed one-shot confirm. Full contract: `docs/api/desk.md`.
 
 | Tool | Does |
 |---|---|
-| `nt_lock(caller, minutes=30, release=False)` | Take, renew or release the local NT8 lock the three writes below require |
+| `nt_lock(caller, minutes=30, release=False)` | Take, renew or release the local NT8 lock the writes below require |
 | `nt_cancel_orphans(caller, account, instrument=None, confirm=None, issued_at=None)` | Cancel every working order whose owning strategy instance is dead |
 | `nt_grid_remove(caller, strategy_id, account, confirm=None, issued_at=None)` | Remove one disabled, dead grid row this server did not start |
 | `nt_grid_enable(caller, strategy_id, account, confirm=None, issued_at=None)` | Re-enable one existing grid row, only if it is in the allowlist file; refuses duplicates |
+| `nt_grid_disable(caller, strategy_id, account, confirm=None, issued_at=None)` | Disable one existing grid row, only if it is in the allowlist file. Keeps the row (no remove) and does NOT flatten; reports position and working orders before and after |
+| `nt_grid_disable_all(caller, ids, confirm=None, issued_at=None)` | `nt_grid_disable` over a list of strategyIds: one plan and one confirm, then each row's own AddOn dry run + confirm |
 | `nt_desk_recover(caller, account=None, confirm=None, issued_at=None)` | After a restart: re-enable every allowlisted leg that is off, one row per leg, under one plan and one confirm; refuses a leg with 0 or 2+ candidate rows |
 | `nt_desk_status()` | One read: process start, last Session Break, connections, expected legs vs enabled vs Realtime, duplicates, orphans, trace age, legs silent past their decision time |
 | `nt_leg_decisions(strategy=None, days=5)` | Each leg's last decision lines from its own CSV, with a "no line today" flag past its decision time |
 | `nt_crash_report(n=100)` | Trace lines before the last Session Break, plus Windows crash events around it |
 
-**The lock.** The three writes take a `caller` name and send nothing unless
+**The lock.** The writes take a `caller` name and send nothing unless
 `Documents\NinjaTrader 8\nt8mcp\nt8.lock` (`{"holder", "expires"}`; `NT8MCP_LOCK_FILE` overrides)
 names that caller and has not expired. It coordinates agents that share one NinjaTrader; it is not
-a security gate. **The allowlist.** `nt_grid_enable` is refused unless
+a security gate. **The allowlist.** `nt_grid_enable` and `nt_grid_disable` are refused unless
 `Documents\NinjaTrader 8\nt8mcp\desk_legs.json` exists (`NT8MCP_DESK_LEGS` in NinjaTrader's own
 environment overrides) and lists the row's (strategy, account, instrument). The same file is the
 list of expected legs for `nt_desk_status`:

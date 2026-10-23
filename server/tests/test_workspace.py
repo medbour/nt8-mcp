@@ -1,5 +1,6 @@
 """Workspace tools (nt8_mcp.tools_workspace) against the canned AddOn in fake_addon.py."""
 
+import json
 import os
 import sys
 import tempfile
@@ -192,3 +193,97 @@ def test_both_slow_reads_carry_their_own_deadline_and_never_move_the_shared_one(
     assert all(t >= before for _p, t, _g in seen), seen
     assert all(g == before for _p, _t, g in seen), "the shared timeout was moved"
     assert app.HTTP_TIMEOUT == before
+
+
+def _capture(fake, path, reply):
+    seen = []
+
+    def handler(req):
+        seen.append(json.loads(req.body))
+        return reply
+
+    fake.register(path, "POST", handler)
+    return seen
+
+
+def test_workspace_ops_post_the_right_body():
+    state = {"ok": True, "observed": True, "active": "MyWorkspace", "open": ["MyWorkspace"], "standingModal": None}
+    with FakeAddon() as fake:
+        sw = _capture(fake, "/workspace/switch", state)
+        op = _capture(fake, "/workspace/open", state)
+        cl = _capture(fake, "/workspace/close", state)
+        sa = _capture(fake, "/workspace/saveAs", state)
+        assert nt8.nt_workspace_switch("MyWorkspace")["observed"] is True
+        nt8.nt_workspace_open("MyWorkspace")
+        nt8.nt_workspace_open("MyWorkspace", activate=False)
+        nt8.nt_workspace_close("MyWorkspace")
+        nt8.nt_workspace_close("MyWorkspace", save=True)
+        nt8.nt_workspace_save_as("MyWorkspace", "MyWorkspace2")
+        nt8.nt_workspace_save_as("MyWorkspace", "MyWorkspace2", overwrite=True)
+    assert sw == [{"name": "MyWorkspace"}]
+    assert op == [{"name": "MyWorkspace", "activate": True}, {"name": "MyWorkspace", "activate": False}]
+    # save defaults to False: a close never saves unless asked, and no body ever carries a remove flag
+    assert cl == [{"name": "MyWorkspace", "save": False}, {"name": "MyWorkspace", "save": True}]
+    assert sa == [{"name": "MyWorkspace", "newName": "MyWorkspace2", "overwrite": False},
+                  {"name": "MyWorkspace", "newName": "MyWorkspace2", "overwrite": True}]
+
+
+def test_workspace_refusal_passes_through_as_error():
+    body = {"ok": False, "error": "'MyWorkspace' is the only open workspace — open another one first; nothing closed",
+            "active": "MyWorkspace", "open": ["MyWorkspace"], "standingModal": None}
+    with FakeAddon() as fake:
+        fake.json("/workspace/close", body, method="POST", status=409)
+        result = nt8.nt_workspace_close("MyWorkspace")
+    assert "only open workspace" in result["error"]
+
+
+def test_workspace_ops_carry_their_own_deadline():
+    from nt8_mcp import app
+
+    seen = []
+
+    def spy(path, body=None, _timeout=None):
+        seen.append((path, _timeout))
+        return {}
+
+    saved = tools_workspace._addon_post
+    tools_workspace._addon_post = spy
+    try:
+        nt8.nt_workspace_open("MyWorkspace")
+    finally:
+        tools_workspace._addon_post = saved
+    assert seen[0][0] == "/workspace/open" and seen[0][1] >= max(app.HTTP_TIMEOUT, 60), seen
+
+
+def test_workspace_op_tools_are_registered_once_and_say_no_ui_no_delete():
+    tools = {t.name: t for t in nt8.mcp._tool_manager.list_tools()}
+    for name in ("nt_workspace_switch", "nt_workspace_open", "nt_workspace_close", "nt_workspace_save_as"):
+        assert name in tools, name
+        doc = tools[name].description
+        assert "No UI is" in doc and "deleted" in doc, name
+
+
+def test_workspace_close_reports_the_answered_prompt():
+    body = {"ok": True, "op": "close", "name": "MyWorkspace", "observed": True, "prompt": "answered No",
+            "saved": False, "returned": True, "wasActive": False, "active": "OtherWorkspace",
+            "open": ["OtherWorkspace"], "standingModal": None}
+    with FakeAddon() as fake:
+        fake.json("/workspace/close", body, method="POST")
+        result = nt8.nt_workspace_close("MyWorkspace")
+    assert result["prompt"] == "answered No" and result["saved"] is False and result["observed"] is True
+
+
+def test_workspace_close_unanswered_prompt_is_a_504_error_with_the_modal():
+    body = {"ok": False, "op": "close", "name": "MyWorkspace", "prompt": "none",
+            "error": "CloseWorkspace is waiting on a dialog this route could not find or answer within 10 s — it is left for the user",
+            "standingModal": "Save Workspace"}
+    with FakeAddon() as fake:
+        fake.json("/workspace/close", body, method="POST", status=504)
+        result = nt8.nt_workspace_close("MyWorkspace")
+    assert "left for the user" in result["error"]
+
+
+def test_workspace_close_docstring_promises_no_cancel_and_save_as_says_it_renames():
+    tools = {t.name: t for t in nt8.mcp._tool_manager.list_tools()}
+    assert "Cancel is never pressed" in tools["nt_workspace_close"].description
+    assert "RENAMES" in tools["nt_workspace_save_as"].description

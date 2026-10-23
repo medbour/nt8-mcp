@@ -48,7 +48,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (sub == "bars")			return Bars(chart, Num(q["n"], 50));
 			if (sub == "indicators")	return Indicators(chart, q["name"], Num(q["n"], 1));
 			if (sub == "drawings")		return Drawings(chart);
-			if (sub == "reload")		return Reload(chart);
+			if (sub == "reload")		return Reload(chart, ref status);
 			return Screenshot(chart, seg[1], body);
 		}
 
@@ -471,19 +471,116 @@ namespace NinjaTrader.NinjaScript.AddOns
 		}
 
 		// ── reload / screenshot ────────────────────────────────────────────────
-		private static string Reload(Gui.Chart.Chart chart)
+		// Why the old path did nothing (8.1.8.4): the menu item is COMMAND-bound. MenuItem.OnClick runs its
+		// Command; RaiseEvent(ClickEvent) only calls Click handlers, and there are none. The public
+		// OnReloadNinjaScriptHotKey on ChartControl is an empty virtual (its IL is one `ret`). The real entry
+		// is the public RoutedCommand ChartCommands.ReloadNinjaScript (handler ReloadNinjaScriptExecuted),
+		// executed here on the chart's own thread with the ChartControl as the route's start.
+		private sealed class Charts_Script { public object Obj; public string Name, State; }
+
+		private static List<Charts_Script> Charts_Scripts(ChartControl cc)
 		{
-			return OnChart(chart, cc =>
+			var list = new List<Charts_Script>();
+			foreach (var src in new System.Collections.IEnumerable[] { cc.Indicators, cc.Strategies })
+				if (src != null)
+					foreach (var o in src)
+					{
+						if (o == null) continue;
+						string st = null;
+						try { var ns = o as NinjaScriptBase; if (ns != null) st = ns.State.ToString(); } catch { }
+						list.Add(new Charts_Script { Obj = o, Name = NameOf(o), State = st });
+					}
+			return list;
+		}
+
+		/// <summary>POST /chart/{id}/reload. Runs NinjaTrader's own Reload NinjaScript command for this chart and
+		/// then WATCHES for the result: `reloaded` is true only when a script instance was replaced or left
+		/// Historical/Realtime and came back. No menu is opened. Refused while a modal is up or the chart carries
+		/// an enabled strategy (a reload restarts it).</summary>
+		private static string Reload(Gui.Chart.Chart chart, ref int status)
+		{
+			string modal = StandingModal();
+			if (modal != null)
 			{
-				// NT8 has no public "reload" method. The right-click entry is ChartControl's private
-				// mnuReloadNinjaScript MenuItem, so raise its Click — that is literally the menu path.
-				// Fallback: the public hot-key handler behind Ctrl+Shift+R.
+				status = 409;
+				return Obj(P("error", Q("refused: a modal dialog is open (" + modal + ")")), P("standingModal", Q(modal)));
+			}
+
+			List<Charts_Script> before = null;
+			string via = null, refused = null;
+			bool canExecute = false;
+			OnChart(chart, cc =>
+			{
+				if (cc.Strategies != null && cc.Strategies.Any(s => s != null && s.IsEnabled))
+				{ refused = "refused: this chart has an enabled strategy attached — a reload restarts it; stop it first"; return ""; }
+				before = Charts_Scripts(cc);
+
 				var f = Charts_mnuReload;		// see /compat: "ChartControl.mnuReloadNinjaScript"
 				var item = f == null ? null : f.GetValue(cc) as System.Windows.Controls.MenuItem;
-				if (item != null) item.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.MenuItem.ClickEvent));
-				else cc.OnReloadNinjaScriptHotKey(cc, null);
-				return Obj(P("ok", "true"));
+				System.Windows.Input.ICommand cmd = item != null && item.Command != null ? item.Command : ChartCommands.ReloadNinjaScript;
+				object param = item != null ? item.CommandParameter : null;
+				string cmdName = item != null && item.Command != null ? "menu item Command" : "ChartCommands.ReloadNinjaScript";
+				var routed = cmd as System.Windows.Input.RoutedCommand;
+				if (routed != null)
+				{
+					// The binding sits somewhere up the route; try the ChartControl, then the chart window.
+					foreach (var target in new System.Windows.IInputElement[] { cc, chart })
+						if (routed.CanExecute(param, target))
+						{
+							routed.Execute(param, target);
+							canExecute = true;
+							via = cmdName + " -> " + target.GetType().Name;
+							break;
+						}
+				}
+				else if (cmd != null && cmd.CanExecute(param))
+				{
+					cmd.Execute(param);
+					canExecute = true;
+					via = cmdName + " (" + cmd.GetType().Name + ")";
+				}
+				return "";
 			});
+			if (refused != null) return Err(ref status, 409, refused);
+			if (!canExecute)
+			{
+				status = 409;
+				return Obj(P("ok", "false"), P("reloaded", "false"), P("canExecute", "false"),
+					P("error", Q("NinjaTrader's Reload NinjaScript command cannot execute on this chart right now (still loading?) — nothing was run")));
+			}
+
+			// The reload runs after the command returns. Watch, off the dispatcher between reads, for up to ~10 s.
+			var seen = new HashSet<string>();
+			bool replaced = false, transition = false, settled = false;
+			List<Charts_Script> after = before;
+			for (int i = 0; i < 20; i++)
+			{
+				Thread.Sleep(500);
+				after = OnChart(chart, cc => Charts_Scripts(cc));
+				replaced = after.Count != before.Count || after.Any(a => !before.Any(b => ReferenceEquals(a.Obj, b.Obj)));
+				foreach (var a in after) if (a.State != null) seen.Add(a.State);
+				// Same instance, different state than before the command (an instance stuck in a dead state before
+				// the reload does not count by itself).
+				transition |= after.Any(a => before.Any(b => ReferenceEquals(a.Obj, b.Obj) && b.State != a.State));
+				settled = after.All(a => a.State == "Historical" || a.State == "Realtime");
+				if ((replaced || transition) && settled) break;
+				if (before.Count == 0) break;		// nothing to watch
+			}
+
+			Func<List<Charts_Script>, string> rows = l => Arr(l.Select(s => Obj(P("name", Q(s.Name)), P("state", Q(s.State)),
+				P("newInstance", before.Any(b => ReferenceEquals(b.Obj, s.Obj)) ? "false" : "true"))));
+			bool? reloaded = before.Count == 0 ? (bool?)null : (replaced || transition);
+			return Obj(
+				P("ok", "true"),
+				P("reloaded", reloaded == null ? "null" : (reloaded.Value ? "true" : "false")),
+				P("via", Q(via)),
+				P("settled", settled ? "true" : "false"),
+				P("statesSeen", Arr(seen.Select(Q))),
+				P("before", Arr(before.Select(s => Obj(P("name", Q(s.Name)), P("state", Q(s.State)))))),
+				P("after", rows(after)),
+				P("note", Q(before.Count == 0 ? "the chart carries no NinjaScript instances: the command ran, nothing to observe"
+					: reloaded == true ? null : "the command ran but no instance was replaced or changed state within ~10 s")),
+				P("standingModal", Q(StandingModal())));
 		}
 
 		private static string Screenshot(Gui.Chart.Chart chart, string id, string body)

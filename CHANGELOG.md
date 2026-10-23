@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.6.0 — 2026-10-23
+
+### Added
+
+- **`nt_workspace_switch`, `nt_workspace_open`, `nt_workspace_close`, `nt_workspace_save_as`** /
+  `POST /workspace/{switch,open,close,saveAs}` (`addon/NT8Bridge.Workspace.cs`): switch, open, close
+  and save-as a workspace with NinjaTrader's own `WorkspaceOptions` methods on the Control Center's
+  thread — no menu, no dialog, no mouse. `open` takes any `<name>.xml` in the workspaces folder, also
+  one the Workspaces menu does not list yet. `close` never passes `removing:true` (nothing is
+  deleted) and answers NinjaTrader's own "Save Workspace" prompt for that workspace inside the
+  process (button automation peer `Invoke`): No for `save:false`, Yes for `save:true`; `prompt`
+  says which, and a prompt it cannot answer in ~10 s is a `504` left for the user. It refuses the
+  only open workspace and a workspace whose Strategies-grid rows hold an enabled or running
+  strategy. `saveAs` refuses an existing file without `overwrite:true` and, like the menu's Save As,
+  renames the open workspace (`renamed`). Every route refuses while a modal is open and answers
+  with a read-back (`active`, `open`, `observed`). Live-tested 2026-10-22 on 8.1.8.4: open, switch,
+  saveAs, reload.
+
+- **`nt_grid_disable`** / `POST /desk/gridDisable` (`addon/NT8BridgeDesk.cs`): disables ONE existing
+  Strategies-grid row by strategyId with the grid's own `StrategyDisable`, and keeps the row, so
+  `nt_grid_enable` can turn it back on (`nt_strategy_stop` removes the row). No flatten, no cancel
+  of its own. Same gates as `nt_grid_enable`: Simulator/Playback only, allowlist, NT8 lock, dry run +
+  signed one-shot confirm, `orders.enabled`. An already-disabled row answers `alreadyDisabled: true`
+  and nothing runs. `before` / `after` show enabled, state, position and working orders.
+  **`nt_grid_disable_all`** (MCP only) runs it over a list of ids under one MCP-signed confirm, with
+  each row's own AddOn dry run + confirm.
+- **`nt_editor_open`** / `POST /editor/open` (new `addon/NT8Bridge.Editor.cs`): opens the NinjaScript
+  Editor as Control Center > New > NinjaScript Editor does, so `nt_compile_f5` no longer needs a human
+  click. Idempotent; compiles, saves and closes nothing. `nt_compile_f5`'s no-editor error now says
+  to call it first.
+- **`NT8_MCP_REQUIRE_PUSHED=1`** (environment, off by default): `nt_install` and `nt_install_addon`
+  refuse a file that is not in a git repo, not committed, or whose branch is not pushed, and copy
+  nothing. For a desk where only pushed code may reach the live charts: `nt_check`, commit, push, install.
+
+### Fixed
+
+- **`nt_chart_reload`** / `POST /chart/{id}/reload` did nothing (8.1.8.4): it raised `Click` on a
+  command-bound menu item, which runs no command. It now executes NinjaTrader's
+  `ChartCommands.ReloadNinjaScript` routed command on the chart's thread and reports what it
+  observed: `reloaded` (an instance replaced or its state changed), `before` / `after` per script,
+  `statesSeen`, `settled`. New refusals (`409`): a modal is open, the chart has an enabled strategy
+  (a reload restarts it), the command cannot execute. Verified live 2026-10-22 (8.1.8.4): an SMA
+  went from `Finalized` to a new instance in `Historical`, via the menu item's Command.
+
+### Changed
+
+- **`nt_leg_decisions`** reads the last N dates per leg and uses CME session days for `noLineToday`.
+  `NT8MCP_DECISIONS_DIR` overrides the decisions folder; the header line is optional, commas are
+  allowed in `inputs`, and a missing or unreadable file is flagged per leg.
+
 ## 1.5.0 — 2026-09-30
 
 ### Sim desk

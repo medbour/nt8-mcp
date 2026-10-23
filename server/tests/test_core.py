@@ -78,6 +78,25 @@ def test_nt_chart_reload_posts_to_one_chart():
     assert seen["path"] == "/chart/c1/reload"
 
 
+def test_nt_chart_reload_returns_what_was_observed():
+    body = {"ok": True, "reloaded": True, "via": "ChartCommands.ReloadNinjaScript -> ChartControl",
+            "settled": True, "statesSeen": ["Historical", "Realtime"],
+            "before": [{"name": "SMA", "state": "Realtime"}],
+            "after": [{"name": "SMA", "state": "Realtime", "newInstance": True}], "note": None}
+    with FakeAddon() as fake:
+        fake.json("/chart/c1/reload", body, method="POST")
+        out = nt8.nt_chart_reload("c1")
+    assert out["reloaded"] is True and out["after"][0]["newInstance"] is True
+
+
+def test_nt_chart_reload_refusal_is_an_error():
+    with FakeAddon() as fake:
+        fake.json("/chart/c1/reload", {"error": "refused: this chart has an enabled strategy attached"},
+                  method="POST", status=409)
+        out = nt8.nt_chart_reload("c1")
+    assert "enabled strategy" in out["error"]
+
+
 def test_addon_error_body_becomes_error_key():
     with FakeAddon() as fake:
         fake.json("/chart/nope", {"error": "no such chart"}, status=404)

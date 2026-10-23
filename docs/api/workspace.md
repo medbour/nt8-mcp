@@ -1,6 +1,7 @@
 # Workspace module (`addon/NT8Bridge.Workspace.cs`)
 
-`GET /workspace`, `GET /strategies/running`, `POST /screenshot`. Documented in `API.md`.
+`GET /workspace`, `GET /strategies/running`, `POST /screenshot`, `POST /workspace/{switch,open,close,saveAs}`.
+Documented in `API.md`.
 
 Read only, with one exception that is not a NinjaTrader state change: `POST /screenshot` writes one
 PNG to a path the caller chose. Nothing here enables, disables, starts or stops a strategy, and
@@ -12,7 +13,9 @@ nothing here restores, fronts, moves or resizes a window.
 | GET | `/strategies/running?materialize=1` | `{"gridResolved":true,"strategies":[…],"notes":[]}` — the Control Center Strategies grid, see below |
 | POST | `/screenshot` body `{"window"\|"chart"\|"hwnd","path"}` | `{"ok":true,"path":..,"window":..,"hwnd":..,"width":..,"height":..,"bytes":..,"method":..,"composited":..,"looksBlank":false}` |
 
-MCP tools: `nt_workspace()`, `nt_strategies_running(materialize=False)`, `nt_window_shot(window="", chart="", hwnd=0, path="")`.
+MCP tools: `nt_workspace()`, `nt_strategies_running(materialize=False)`, `nt_window_shot(window="", chart="", hwnd=0, path="")`,
+`nt_workspace_switch(name)`, `nt_workspace_open(name, activate=True)`, `nt_workspace_close(name, save=False)`,
+`nt_workspace_save_as(name, new_name, overwrite=False)` — see the last section.
 
 ---
 
@@ -180,3 +183,58 @@ desktop can be printed, which is no more than the no-target form (the whole virt
 `POST /chart/{id}/screenshot` (the chart module's capture of the chart canvas only) is
 untouched and still works; `POST /screenshot {"chart":"first"}` captures the chart's whole **window**
 instead, decorations and Chart Trader included.
+
+---
+
+## `POST /workspace/{switch,open,close,saveAs}`
+
+Switch, open, close and save-as a workspace **without driving the UI**: no menu, no mouse, no keys.
+The one dialog NinjaTrader raises on the way (close's save prompt) is answered inside NinjaTrader.
+Each route calls a public static on `NinjaTrader.Gui.Tools.WorkspaceOptions` on the Control Center's
+own dispatcher, the thread its Workspaces menu runs on.
+
+| Route | Body | NinjaTrader call |
+|---|---|---|
+| `switch` | `{"name":"MyWorkspace"}` | `SwitchToWorkspace(name)` — the workspace must be open |
+| `open` | `{"name":"MyWorkspace","activate":true}` | `OpenWorkspace(name, activate)`. The file `<WorkspacesFolderPath>/MyWorkspace.xml` must exist. A file written after NinjaTrader started is not in `SavedWorkspaces` (the list the Workspaces menu shows, built at start); the name is added to it first (`addedToSavedList`). Already open: a switch when `activate`, else nothing (`alreadyOpen:true`) |
+| `close` | `{"name":"MyWorkspace","save":false}` | `CloseWorkspace(name, hideOnly:false, removing:false, isActive)`, queued with `BeginInvoke`; its save prompt is answered No (`save:false`) or Yes (`save:true`) — see below |
+| `saveAs` | `{"name":"MyWorkspace","newName":"MyWorkspace2","overwrite":false}` | `SaveWorkspaceAs(name, newName, isActive, isNew:false)`. Renames the open workspace, see below |
+
+```json
+{"ok": true, "op": "close", "name": "MyWorkspace", "observed": true, "prompt": "answered No", "saved": false,
+ "returned": true, "wasActive": false, "active": "OtherWorkspace", "open": ["OtherWorkspace"], "standingModal": null}
+```
+
+- **Nothing is deleted.** `removing` is always `false`: `removing:true` is NinjaTrader's "Remove
+  workspace" path, which deletes the file. No route takes a flag for it.
+- **Read-back, not return values.** After the call the AddOn re-reads `Globals.ActiveWorkspace` and
+  `WorkspaceOptions.OpenWorkspacesFromXml` for up to ~5 s. `observed` (and `ok`) is true only when the
+  read-back shows the change: the active name for `switch` / `open` with `activate`, the name in /
+  out of the open list for `open` / `close`, a file newer than before for `saveAs`. `returned` is
+  NinjaTrader's own bool, reported beside it. `open` is `null` when the list could not be read.
+- **Refusals** (`{ok:false, error, active, open, standingModal}`): `400` a name with a path,
+  separator or `_Workspaces` (NinjaTrader's index file); `404` no such file (`open`); `409` not open
+  (`switch`, `close`, `saveAs`), the only open workspace (`close`), `newName` exists without
+  `overwrite:true` or is open (`saveAs`), a modal message box is standing (every route); `503` no
+  Control Center, or the open list / Strategies grid could not be read.
+- **Strategies.** The Strategies grid's `Workspace` column files each strategy under the workspace it
+  was started in. `close` refuses while a row filed under that workspace (or one whose column cannot
+  be read) is enabled or has a live instance. What a close does to a running strategy is not tested,
+  so the route never finds out on a live desk: stop or disable it first. `switch` hides the other
+  workspace's windows and does not touch the grid.
+- **Close answers NinjaTrader's save prompt itself.** `CloseWorkspace` raises an `NTMessageBox`
+  "Save Workspace" — "Do you want to save workspace '<name>'?", Yes / No / Cancel — and does not
+  return until it is answered (observed live 2026-10-22, 8.1.8.4; a synchronous call hung the request).
+  So the call is queued with `BeginInvoke` on the Control Center's dispatcher and the request thread
+  looks for that box among NinjaTrader's own windows, on the box's own dispatcher (a modal pumps a
+  nested frame, so the hop is served). It answers ONLY a message box whose text says "save" and names
+  this workspace as a whole word: **No** for `save:false`, **Yes** for `save:true` (NinjaTrader's Yes
+  is the save, so no separate `SaveWorkspaceAs` runs). The button is pressed inside the process with
+  its `ButtonAutomationPeer`'s `IInvokeProvider.Invoke()` — the button's own click path — never mouse
+  or keys. Cancel is never pressed and no other dialog is touched. `prompt` reports `"answered No"`,
+  `"answered Yes"` or `"none"` (`save:true` with no prompt adds a `note`: nothing was saved). When the
+  prompt is not found or answered within ~10 s, or the close has not returned ~10 s after the answer,
+  the answer is `504` with `standingModal`, and the dialog is left for the user.
+- **Save As renames the open workspace** (observed live 2026-10-22), exactly as the menu's Save As does:
+  afterwards `newName` is open and `name` is not; `name.xml` stays on disk. `renamed:true` says so.
+  Open `name` again if you need both.

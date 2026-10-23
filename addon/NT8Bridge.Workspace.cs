@@ -7,8 +7,10 @@
 // (Derived: the GDI PrintWindow capture and its finally block, the EnumWindows-by-pid title match,
 //  the Control Center StrategiesGrid reach and its virtualization handling.)
 //
-// READ ONLY except for one PNG written to a path the caller chose. Nothing here enables, disables,
-// starts or stops a strategy, and nothing here restores, fronts, moves or resizes a window.
+// READ ONLY except for one PNG written to a path the caller chose, and the four POST /workspace/*
+// operations (switch, open, close, saveAs) at the end of this file. Nothing here enables, disables,
+// starts or stops a strategy, and nothing here restores, fronts, moves or resizes a window by itself
+// (a workspace switch/open/close shows and hides that workspace's windows, as NinjaTrader's own menu does).
 
 #region Using declarations
 using System;
@@ -30,7 +32,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 {
 	public partial class NT8Bridge
 	{
-		/// <summary>Seam (NOTES.md "Module seams"): GET /workspace, GET /strategies/running, POST /screenshot.
+		/// <summary>Seam (NOTES.md "Module seams"): GET /workspace, GET /strategies/running, POST /screenshot,
+		/// POST /workspace/{switch|open|close|saveAs}.
 		/// Null for everything else — GET /strategies (the type listing) stays with Route_Backtest, and
 		/// POST /chart/{id}/screenshot stays with Route_Charts.</summary>
 		private static string Route_Workspace(string method, string[] seg, System.Collections.Specialized.NameValueCollection q, string body, ref int status)
@@ -39,6 +42,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (method == "GET" && seg.Length == 2 && seg[0] == "strategies" && seg[1] == "running")
 				return Ws_Running(Ws_Flag(q["materialize"]));
 			if (method == "POST" && seg.Length == 1 && seg[0] == "screenshot") return Ws_Shot(body, ref status);
+			if (method == "POST" && seg.Length == 2 && seg[0] == "workspace"
+				&& (seg[1] == "switch" || seg[1] == "open" || seg[1] == "close" || seg[1] == "saveAs"))
+				return Ws_Op(seg[1], body, ref status);
 			return null;
 		}
 
@@ -680,6 +686,359 @@ namespace NinjaTrader.NinjaScript.AddOns
 				try { if (screenDc != IntPtr.Zero && screenDc != srcDc) Ws_ReleaseDC(IntPtr.Zero, screenDc); } catch { }
 				try { if (srcDc != IntPtr.Zero) Ws_ReleaseDC(fullScreen ? IntPtr.Zero : target, srcDc); } catch { }
 			}
+		}
+
+		// ── POST /workspace/{switch|open|close|saveAs} ───────────────────────────
+		// No UI is driven. Every call is a public static on NinjaTrader.Gui.Tools.WorkspaceOptions, run on the
+		// Control Center's own dispatcher (the thread its Workspaces menu runs on): no menu is opened and this
+		// code shows no dialog. Nothing is deleted: CloseWorkspace is always called with removing:false
+		// (removing:true is the "Remove workspace" path, which deletes the file). Refused while a modal is
+		// standing: a call queued behind a modal frame would run under the user's hand.
+		// Each answer is a READ-BACK (Globals.ActiveWorkspace + WorkspaceOptions.OpenWorkspacesFromXml after the
+		// call), never the return value alone: `observed` says whether the read-back shows the change.
+		private static readonly TimeSpan Ws_OpTimeout = TimeSpan.FromSeconds(10);
+
+		/// <summary>Open = null when the list could not be read ("unknown", never "none open").</summary>
+		private sealed class Ws_Snap { public string Active; public List<string> Open; }
+
+		/// <summary>ON THE CONTROL CENTER'S DISPATCHER.</summary>
+		private static Ws_Snap Ws_Read()
+		{
+			var s = new Ws_Snap();
+			try { s.Active = Core.Globals.ActiveWorkspace; } catch (Exception ex) { Log("workspace active: " + Deep(ex)); }
+			try { var o = Gui.Tools.WorkspaceOptions.OpenWorkspacesFromXml; if (o != null) s.Open = o.ToList(); }
+			catch (Exception ex) { Log("workspace open list: " + Deep(ex)); }
+			return s;
+		}
+
+		/// <summary>Bounded hop to the Control Center's thread. A call that has started is waited for (Ui()).</summary>
+		private static T Ws_OnCc<T>(Window cc, Func<T> f) { return Ui(cc.Dispatcher, f, Ws_OpTimeout, "ControlCenter"); }
+
+		/// <summary>Re-read until `done` holds or ~5 s pass: NinjaTrader shows and hides windows after the call returns.</summary>
+		private static Ws_Snap Ws_Poll(Window cc, Func<Ws_Snap, bool> done, out bool held)
+		{
+			Ws_Snap s = null;
+			held = false;
+			for (int i = 0; i < 10 && !held; i++)
+			{
+				System.Threading.Thread.Sleep(500);
+				s = Ws_OnCc(cc, Ws_Read);
+				held = done(s);
+			}
+			return s;
+		}
+
+		private static bool Ws_Eq(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+		private static string Ws_B(bool b) { return b ? "true" : "false"; }
+
+		/// <summary>The spelling NinjaTrader uses, from `list` (case-insensitive, as Windows file names are), or null.</summary>
+		private static string Ws_In(List<string> list, string name) { return list == null ? null : list.FirstOrDefault(n => Ws_Eq(n, name)); }
+
+		/// <summary>A workspace name, checked as a FILE name: no path, no separator, not NinjaTrader's own index.</summary>
+		private static string Ws_Name(Dictionary<string, object> m, string key)
+		{
+			string n = JGetStr(m, key, null);
+			if (string.IsNullOrWhiteSpace(n)) throw new BadRequestException(key + " is required");
+			n = n.Trim();
+			if (n.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || n == "." || n == ".." || Ws_Eq(n, "_Workspaces"))
+				throw new BadRequestException(key + " '" + n + "' is not a workspace name (no path, no separator)");
+			return n;
+		}
+
+		private static string[] Ws_State(Ws_Snap s)
+		{
+			return new[] { P("active", Q(s.Active)), P("open", s.Open == null ? "null" : Arr(s.Open.Select(Q))), P("standingModal", Q(StandingModal())) };
+		}
+
+		private static string Ws_Refuse(ref int status, int code, string msg, Ws_Snap s)
+		{
+			status = code;
+			return Obj(new[] { P("ok", "false"), P("error", Q(msg)) }.Concat(Ws_State(s)).ToArray());
+		}
+
+		/// <summary>`ok` = the read-back shows the change (`observed`), not "the call returned".</summary>
+		private static string Ws_Done(string op, string name, bool observed, Ws_Snap s, params string[] extra)
+		{
+			var pairs = new List<string> { P("ok", Ws_B(observed)), P("op", Q(op)), P("name", Q(name)), P("observed", Ws_B(observed)) };
+			pairs.AddRange(extra);
+			pairs.AddRange(Ws_State(s));
+			return Obj(pairs.ToArray());
+		}
+
+		private static string Ws_Op(string op, string body, ref int status)
+		{
+			Dictionary<string, object> m;
+			try { m = ParseJson(body) as Dictionary<string, object>; }
+			catch (Exception ex) { return Err(ref status, 400, "bad JSON body: " + ex.Message); }
+
+			string modal = StandingModal();
+			if (modal != null)
+			{
+				status = 409;
+				return Obj(P("error", Q("refused: a modal dialog is open (" + modal + ")")), P("standingModal", Q(modal)));
+			}
+			Window cc = Sr_ControlCenter();
+			if (cc == null) return Err(ref status, 503, "no Control Center window in the registry");
+
+			try
+			{
+				string name = Ws_Name(m, "name");
+				if (op == "switch") return Ws_Switch(cc, name, ref status);
+				if (op == "open") return Ws_Open(cc, name, JGetBool(m, "activate", true), ref status);
+				if (op == "close") return Ws_Close(cc, name, JGetBool(m, "save", false), ref status);
+				return Ws_SaveAs(cc, name, Ws_Name(m, "newName"), JGetBool(m, "overwrite", false), ref status);
+			}
+			catch (TimeoutException) { throw; }		// -> the core's 504
+			catch (BadRequestException ex) { return Err(ref status, 400, ex.Message); }
+		}
+
+		/// <summary>POST /workspace/switch {name}: WorkspaceOptions.SwitchToWorkspace on an OPEN workspace.</summary>
+		private static string Ws_Switch(Window cc, string name, ref int status)
+		{
+			var s = Ws_OnCc(cc, Ws_Read);
+			if (s.Open == null) return Ws_Refuse(ref status, 503, "the open-workspace list could not be read", s);
+			string canon = Ws_In(s.Open, name);
+			if (canon == null) return Ws_Refuse(ref status, 409, "'" + name + "' is not open — open it with POST /workspace/open", s);
+			if (Ws_Eq(s.Active, canon)) return Ws_Done("switch", canon, true, s, P("alreadyActive", "true"));
+			Ws_OnCc(cc, () => { Gui.Tools.WorkspaceOptions.SwitchToWorkspace(canon); return 0; });
+			bool held;
+			s = Ws_Poll(cc, x => Ws_Eq(x.Active, canon), out held);
+			return Ws_Done("switch", canon, held, s, P("alreadyActive", "false"));
+		}
+
+		/// <summary>POST /workspace/open {name, activate=true}: WorkspaceOptions.OpenWorkspace on a FILE in the
+		/// workspaces folder, also one written after NinjaTrader started (its Workspaces menu list is built at
+		/// start). Already open = a switch when `activate`, else nothing.</summary>
+		private static string Ws_Open(Window cc, string name, bool activate, ref int status)
+		{
+			string folder = Gui.Tools.WorkspaceOptions.WorkspacesFolderPath;
+			string[] hit = string.IsNullOrEmpty(folder) || !Directory.Exists(folder) ? new string[0] : Directory.GetFiles(folder, name + ".xml");
+			if (hit.Length != 1)
+				return Err(ref status, 404, "no workspace file '" + name + ".xml' in NinjaTrader's workspaces folder — nothing opened");
+			string canon = Path.GetFileNameWithoutExtension(hit[0]);		// the file's own spelling
+
+			var s = Ws_OnCc(cc, Ws_Read);
+			if (s.Open == null) return Ws_Refuse(ref status, 503, "the open-workspace list could not be read — nothing opened", s);
+			string open = Ws_In(s.Open, canon);
+			if (open != null)
+			{
+				if (activate && !Ws_Eq(s.Active, open)) return Ws_Switch(cc, open, ref status);
+				return Ws_Done("open", open, true, s, P("alreadyOpen", "true"));
+			}
+
+			bool added = false;
+			bool returned = Ws_OnCc(cc, () =>
+			{
+				// SavedWorkspaces is the list the Workspaces menu shows, filled at NinjaTrader start: a file written
+				// since is missing from it. Add the name so NinjaTrader's own bookkeeping knows what it opens.
+				var saved = Gui.Tools.WorkspaceOptions.SavedWorkspaces;
+				if (saved != null && !saved.Any(n => Ws_Eq(n, canon))) { saved.Add(canon); added = true; }
+				return Gui.Tools.WorkspaceOptions.OpenWorkspace(canon, activate);
+			});
+			bool held;
+			s = Ws_Poll(cc, x => Ws_In(x.Open, canon) != null && (!activate || Ws_Eq(x.Active, canon)), out held);
+			return Ws_Done("open", canon, held, s, P("alreadyOpen", "false"), P("returned", Ws_B(returned)), P("addedToSavedList", Ws_B(added)));
+		}
+
+		/// <summary>POST /workspace/close {name, save=false}: WorkspaceOptions.CloseWorkspace(name, hideOnly:false,
+		/// removing:false, isActive), queued; NinjaTrader's own save prompt is answered here (No, or Yes for save:true).
+		/// Refused when it is the only open workspace, and when the Strategies grid files an enabled or running
+		/// strategy under it.</summary>
+		private static string Ws_Close(Window cc, string name, bool save, ref int status)
+		{
+			var s = Ws_OnCc(cc, Ws_Read);
+			if (s.Open == null) return Ws_Refuse(ref status, 503, "the open-workspace list could not be read — nothing closed", s);
+			string canon = Ws_In(s.Open, name);
+			if (canon == null) return Ws_Refuse(ref status, 409, "'" + name + "' is not open — nothing closed", s);
+			if (s.Open.Count < 2) return Ws_Refuse(ref status, 409, "'" + canon + "' is the only open workspace — open another one first; nothing closed", s);
+
+			// The grid's Workspace column files each strategy under the workspace it was started in. What closing
+			// that workspace does to a running strategy is not tested here, so a strategy that is enabled or alive
+			// in it refuses the close. Liveness by Id is read on this thread, the grid on the Control Center's.
+			var idStates = Desk_IdStates(Desk_All());
+			var rows = Ws_OnCc(cc, () => Desk_GridRows(cc));
+			if (rows == null)
+				return Ws_Refuse(ref status, 503, "the Strategies grid could not be read, so a running strategy in '" + canon
+					+ "' cannot be ruled out — open the Control Center's Strategies tab once, then retry; nothing closed", s);
+			var busy = new List<string>();
+			foreach (var r in rows)
+			{
+				string ws = null, live;
+				try { ws = r.Entry.Workspace; } catch { }
+				idStates.TryGetValue(r.Id, out live);
+				// An unreadable Workspace column cannot clear a live row.
+				if ((ws == null || Ws_Eq(ws, canon)) && (r.Enabled || Desk_Active(live)))
+					busy.Add(r.Name + " #" + r.Id.ToString(CultureInfo.InvariantCulture));
+			}
+			if (busy.Count > 0)
+				return Ws_Refuse(ref status, 409, "'" + canon + "' holds enabled or running strategies (" + string.Join(", ", busy)
+					+ ") — stop or disable them first; nothing closed", s);
+
+			bool isActive = Ws_Eq(s.Active, canon);
+			// CloseWorkspace raises NinjaTrader's own "Save Workspace" NTMessageBox ("Do you want to save workspace
+			// '<name>'?", Yes/No/Cancel) and does not return until it is answered (observed live 8.1.8.4). So it is
+			// QUEUED with BeginInvoke, never waited on, and this thread answers that one prompt: save:false = No,
+			// save:true = Yes (NinjaTrader's Yes is the save, so no separate SaveWorkspaceAs runs). Cancel is never
+			// pressed and no other dialog is touched. hideOnly:false = a real close; removing:false = never the delete path.
+			var call = new Ws_Pending();
+			cc.Dispatcher.BeginInvoke(new Action(() =>
+			{
+				try { call.Returned = Gui.Tools.WorkspaceOptions.CloseWorkspace(canon, false, false, isActive); }
+				catch (Exception ex) { call.Error = Deep(ex); }
+				finally { call.Done = true; }
+			}));
+
+			string want = save ? "Yes" : "No", prompt = "none";
+			var until = DateTime.UtcNow + Ws_PromptWait;
+			while (!call.Done && DateTime.UtcNow < until)
+			{
+				System.Threading.Thread.Sleep(200);
+				if (prompt != "none" || call.Done) continue;
+				if (Ws_AnswerPrompt(canon, want)) { prompt = "answered " + want; until = DateTime.UtcNow + Ws_PromptWait; }
+			}
+			if (!call.Done)
+			{
+				status = 504;
+				string modal = StandingModal();
+				return Obj(P("ok", "false"), P("op", Q("close")), P("name", Q(canon)), P("prompt", Q(prompt)),
+					P("error", Q(prompt == "none"
+						? "CloseWorkspace is waiting on a dialog this route could not find or answer within "
+							+ Ws_PromptWait.TotalSeconds.ToString("0", CultureInfo.InvariantCulture) + " s — it is left for the user"
+						: "the prompt was " + prompt + " but CloseWorkspace has not returned yet")),
+					P("standingModal", Q(modal)));
+			}
+			if (call.Error != null) return Ws_Refuse(ref status, 500, "CloseWorkspace threw: " + call.Error, Ws_OnCc(cc, Ws_Read));
+
+			bool held;
+			s = Ws_Poll(cc, x => x.Open != null && Ws_In(x.Open, canon) == null, out held);
+			var extra = new List<string>
+			{
+				P("prompt", Q(prompt)),
+				P("saved", prompt == "answered Yes" ? "true" : "false"),
+				P("returned", Ws_B(call.Returned)),
+				P("wasActive", Ws_B(isActive))
+			};
+			if (save && prompt == "none") extra.Add(P("note", Q("NinjaTrader asked nothing, so nothing was saved")));
+			return Ws_Done("close", canon, held, s, extra.ToArray());
+		}
+
+		/// <summary>The close queued on the Control Center's dispatcher. Written there, read by the request thread.</summary>
+		private sealed class Ws_Pending { public volatile bool Done; public bool Returned; public string Error; }
+
+		/// <summary>How long close waits for its prompt, and again for CloseWorkspace to return after the answer.</summary>
+		private static readonly TimeSpan Ws_PromptWait = TimeSpan.FromSeconds(10);
+
+		/// <summary>Find NinjaTrader's "save workspace" message box for THIS workspace and press `button` ("Yes" or
+		/// "No") inside the process. Only a message box whose text says "save" and names the workspace as a whole
+		/// word is touched; any other dialog is left alone. The press is the button's own automation peer Invoke —
+		/// the same OnClick a real click runs (Click handlers and any Command), no mouse, no keys. Runs on the box's
+		/// dispatcher: a modal pumps a nested frame there, so the hop is served while CloseWorkspace waits.
+		/// True = pressed.</summary>
+		private static bool Ws_AnswerPrompt(string workspace, string button)
+		{
+			var named = new System.Text.RegularExpressions.Regex(@"(?<![\w])" + System.Text.RegularExpressions.Regex.Escape(workspace) + @"(?![\w])",
+				System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+			HashSet<Window> owned;
+			foreach (var w in KnownWindows(out owned))
+			{
+				if (w.GetType().Name.IndexOf("MessageBox", StringComparison.OrdinalIgnoreCase) < 0) continue;
+				var box = w;
+				try
+				{
+					bool pressed = Ui(box.Dispatcher, () =>
+					{
+						var text = new StringBuilder(TitleOf(box)).Append('\n');
+						var buttons = new List<System.Windows.Controls.Button>();
+						Ws_Walk(box, d =>
+						{
+							var tb = d as System.Windows.Controls.TextBlock;
+							if (tb != null && !string.IsNullOrEmpty(tb.Text)) text.Append(tb.Text).Append('\n');
+							var tx = d as System.Windows.Controls.TextBox;
+							if (tx != null && !string.IsNullOrEmpty(tx.Text)) text.Append(tx.Text).Append('\n');
+							var b = d as System.Windows.Controls.Button;
+							if (b != null) buttons.Add(b);
+						});
+						string all = text.ToString();
+						if (all.IndexOf("save", StringComparison.OrdinalIgnoreCase) < 0 || !named.IsMatch(all)) return false;
+						var target = buttons.FirstOrDefault(b => b.IsEnabled && b.IsVisible && Ws_Label(b) == button);
+						if (target == null) return false;
+						var peer = new System.Windows.Automation.Peers.ButtonAutomationPeer(target);
+						var invoke = peer.GetPattern(System.Windows.Automation.Peers.PatternInterface.Invoke)
+							as System.Windows.Automation.Provider.IInvokeProvider;
+						if (invoke == null) return false;
+						invoke.Invoke();
+						return true;
+					}, TimeSpan.FromSeconds(2), "message box");
+					if (pressed) { Log("workspace close: answered '" + button + "' to the save prompt for '" + workspace + "'"); return true; }
+				}
+				catch (Exception ex) { Log("workspace close prompt: " + Deep(ex)); }
+			}
+			return false;
+		}
+
+		/// <summary>A button's visible label: string content, or the text of the TextBlock / AccessText inside it,
+		/// with the access-key underscore removed ("_No" -> "No"). Its own thread only.</summary>
+		private static string Ws_Label(System.Windows.Controls.Button b)
+		{
+			string s = b.Content as string;
+			if (s == null)
+				Ws_Walk(b, d =>
+				{
+					var tb = d as System.Windows.Controls.TextBlock;
+					if (s == null && tb != null && !string.IsNullOrEmpty(tb.Text)) s = tb.Text;
+					var at = d as System.Windows.Controls.AccessText;
+					if (s == null && at != null && !string.IsNullOrEmpty(at.Text)) s = at.Text;
+				});
+			return s == null ? null : s.Replace("_", "").Trim();
+		}
+
+		/// <summary>Every visual descendant, depth first. Its own thread only.</summary>
+		private static void Ws_Walk(DependencyObject root, Action<DependencyObject> visit)
+		{
+			int n;
+			try { n = VisualTreeHelper.GetChildrenCount(root); } catch { return; }
+			for (int i = 0; i < n; i++)
+			{
+				var child = VisualTreeHelper.GetChild(root, i);
+				if (child == null) continue;
+				visit(child);
+				Ws_Walk(child, visit);
+			}
+		}
+
+		/// <summary>POST /workspace/saveAs {name, newName, overwrite=false}: WorkspaceOptions.SaveWorkspaceAs(name,
+		/// newName, isActive, isNew:false) on an OPEN workspace. `observed` = the file newName.xml was written.
+		/// Like the menu's Save As it RENAMES the open workspace (observed live 8.1.8.4): afterwards newName is
+		/// open and name is not; name.xml stays on disk.</summary>
+		private static string Ws_SaveAs(Window cc, string name, string newName, bool overwrite, ref int status)
+		{
+			var s = Ws_OnCc(cc, Ws_Read);
+			if (s.Open == null) return Ws_Refuse(ref status, 503, "the open-workspace list could not be read — nothing saved", s);
+			string canon = Ws_In(s.Open, name);
+			if (canon == null) return Ws_Refuse(ref status, 409, "'" + name + "' is not open — Save As saves an open workspace's windows; nothing saved", s);
+			if (Ws_In(s.Open, newName) != null) return Ws_Refuse(ref status, 409, "'" + newName + "' is open — close it first; nothing saved", s);
+			string folder = Gui.Tools.WorkspaceOptions.WorkspacesFolderPath;
+			if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+				return Ws_Refuse(ref status, 503, "NinjaTrader's workspaces folder could not be read — nothing saved", s);
+			string file = Path.Combine(folder, newName + ".xml");
+			bool existed = File.Exists(file);
+			if (existed && !overwrite)
+				return Ws_Refuse(ref status, 409, "a workspace file '" + newName + ".xml' exists — pass overwrite:true to replace it; nothing saved", s);
+			DateTime was = existed ? File.GetLastWriteTimeUtc(file) : DateTime.MinValue;
+
+			bool isActive = Ws_Eq(s.Active, canon);
+			bool returned = Ws_OnCc(cc, () => Gui.Tools.WorkspaceOptions.SaveWorkspaceAs(canon, newName, isActive, false));
+			bool written = false;
+			for (int i = 0; i < 10 && !written; i++)		// file I/O off the dispatcher, after the call
+			{
+				written = File.Exists(file) && File.GetLastWriteTimeUtc(file) > was;
+				if (!written) System.Threading.Thread.Sleep(500);
+			}
+			s = Ws_OnCc(cc, Ws_Read);
+			return Ws_Done("saveAs", canon, written, s, P("newName", Q(newName)), P("file", Q(newName + ".xml")),
+				P("overwrote", Ws_B(existed && written)), P("returned", Ws_B(returned)),
+				// true = newName is now the open workspace in place of name (NinjaTrader's Save As renames it)
+				P("renamed", s.Open == null ? "null" : Ws_B(Ws_In(s.Open, newName) != null && Ws_In(s.Open, canon) == null)));
 		}
 	}
 }

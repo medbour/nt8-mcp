@@ -34,6 +34,7 @@ found is listed as `ownerUnknown` and is never cancelled by `/desk/cancelOrphans
 | POST | `/desk/cancelOrphans` | `{account, instrument?, confirm?, issuedAt?}` |
 | POST | `/desk/gridRemove` | `{account, strategyId, confirm?, issuedAt?}` |
 | POST | `/desk/gridEnable` | `{account, strategyId, confirm?, issuedAt?}` |
+| POST | `/desk/gridDisable` | `{account, strategyId, confirm?, issuedAt?}` |
 
 `strategyId` is the `strategyId` of a `GET /strategies/running` row, sent as a string.
 
@@ -54,11 +55,26 @@ moved instance is disabled and refused, like `/strategy/start`). Refused: no all
 enabled or alive (`409 alreadyEnabled`), another row or running instance of the same (strategy type,
 account) is enabled or alive (`409 duplicate`).
 
+**gridDisable.** The grid's own `StrategyDisable(strategy)` (the same as unticking Enabled) on one
+existing row, dispatched with `BeginInvoke` on the Control Center's dispatcher against the live
+instance with the row's Id (NinjaTrader runs a clone). It **keeps the row** so `gridEnable` can turn
+it back on, does not flatten, and cancels nothing itself (NinjaTrader's own
+`CancelEntriesOnStrategyDisable` option still applies). Then the Id's state and the row's Enabled
+flag are polled for up to 8 s. Refused: no allowlist file (`403 noAllowlist`), (strategy, account,
+instrument) not in it (`403 notAllowlisted`), no such row (`404 noSuchRow`), the row is on another
+account (`409 accountMismatch`). A row that is already disabled and dead answers
+`200 {ok:true, alreadyDisabled:true, before, after}` with no dry run and nothing dispatched. The plan
+and the answer carry `before` (and, after the act, `after`): `enabled`, `state`, `position`
+{side, quantity, averagePrice}, `flat`, `workingOrders` (live order ids on the row's account in the
+row's instrument, whoever placed them). `ok` = the row is still in the grid, reads Enabled=false and
+no instance with its Id is in Configure..Realtime; otherwise `502 rowDisableUnverified` with the
+same fields.
+
 ## Files (outside the repo)
 
 | File | Default path | Override | Read by |
 |---|---|---|---|
-| allowlist / expected legs | `Documents\NinjaTrader 8\nt8mcp\desk_legs.json` | `NT8MCP_DESK_LEGS` | the AddOn (its own process environment) for gridEnable; the MCP server for `nt_desk_status` |
+| allowlist / expected legs | `Documents\NinjaTrader 8\nt8mcp\desk_legs.json` | `NT8MCP_DESK_LEGS` | the AddOn (its own process environment) for gridEnable and gridDisable; the MCP server for `nt_desk_status` |
 | NT8 lock | `Documents\NinjaTrader 8\nt8mcp\nt8.lock` | `NT8MCP_LOCK_FILE` | the MCP server only |
 | per-leg decisions | `Documents\NinjaTrader 8\nt8mcp\decisions\<strategy>_<account>.csv` | `NT8MCP_DECISIONS_DIR` (the folder) | the MCP server only (`nt_leg_decisions`, `nt_desk_status`) |
 
@@ -89,7 +105,7 @@ date_et,time_et,decision,reason,inputs
 `MM/DD/YYYY` or `YYYYMMDD`.
 
 `nt8.lock` is `{"holder": "<caller>", "expires": <epoch seconds>}`, written by `nt_lock(caller,
-minutes)`. The three MCP writes send nothing unless it names their `caller` and has not expired. It
+minutes)`. The MCP writes send nothing unless it names their `caller` and has not expired. It
 coordinates agents sharing one NinjaTrader; it is not a security gate.
 
 ## Restart recovery: `nt_desk_recover(caller, account=None, confirm=None, issued_at=None)`
@@ -115,6 +131,16 @@ MCP only, no new AddOn path: it is `nt_grid_enable` run once per leg under one p
    reads `Realtime`; otherwise `failed` with `reason` (the AddOn refusal, or the state seen).
    `ok` = every planned leg enabled. Legs not planned come back under `notTouched`.
 
+## Disable a list: `nt_grid_disable_all(caller, ids, confirm=None, issued_at=None)`
+
+MCP only, the same shape as `nt_desk_recover`. Dry run: `GET /strategies/running`, then for each id
+the AddOn's own `/desk/gridDisable` dry run: `planned` (with `before`), `off` (already disabled) or
+`refused` + reason (no row, not allowlisted, live account, ...). Confirm: the same `confirm` and
+`issuedAt` within 30 s, an HMAC over the caller, `issuedAt` and the planned (strategyId, account)
+list, rebuilt NOW and accepted ONCE. Then each planned row gets a fresh `/desk/gridDisable` dry run
+and its own one-shot AddOn confirm. Per row `result` = `disabled` (the AddOn answered ok) or
+`failed` + `reason`, with `after`. Nothing is removed or flattened.
+
 ## MCP reads (no AddOn write)
 
 - `nt_desk_status()` — process start (`Get-Process NinjaTrader`), the last `Session Break` line in the
@@ -136,5 +162,6 @@ MCP only, no new AddOn path: it is `nt_grid_enable` run once per leg under one p
 ## Not verified against a running NinjaTrader yet
 
 Compile-checked only. What `GetOwnerStrategy()` and `StrategyBase.Orders` return for a terminated
-instance, and what `StrategyEnable` does with an existing row's entry, are undocumented NinjaTrader
+instance, what `StrategyEnable` does with an existing row's entry, and whether `StrategyDisable` clears the
+row's Enabled flag (gridDisable reports it either way), are undocumented NinjaTrader
 behaviour: check `nt_desk_status` and a dry run on your Simulator account before the first confirm.

@@ -311,3 +311,51 @@ def test_the_compile_tools_are_three_distinct_registered_names():
     assert "nt_compile_addon" not in names      # the old name is gone
     assert nt8.nt_compile is not nt8.nt_compile_f5
     assert nt8.nt_compile is not tools_compile.compile_via_addon
+
+
+def test_editor_open_posts_once_and_passes_the_answer_through():
+    seen = []
+
+    def handler(req):
+        seen.append((req.method, req.query, req.body))
+        return {"ok": True, "alreadyOpen": False, "windowTitle": "NinjaScript Editor"}
+
+    with FakeAddon() as fake:
+        fake.register("/editor/open", "POST", handler)
+        result = nt8.nt_editor_open()
+    assert seen == [("POST", {}, "")], seen       # no body, no query: there is nothing to configure
+    assert result == {"ok": True, "alreadyOpen": False, "windowTitle": "NinjaScript Editor"}
+
+
+def test_editor_open_reports_an_already_open_editor():
+    with FakeAddon() as fake:
+        fake.json("/editor/open", {"ok": True, "alreadyOpen": True, "windowTitle": "NinjaScript Editor - x"}, method="POST")
+        result = nt8.nt_editor_open()
+    assert result["alreadyOpen"] is True and result["ok"] is True
+
+
+def test_editor_open_surfaces_the_addon_error():
+    with FakeAddon() as fake:
+        fake.json("/editor/open", {"error": "no Control Center window in the registry"}, method="POST", status=503)
+        result = nt8.nt_editor_open()
+    assert result == {"error": "no Control Center window in the registry"}
+
+
+def test_editor_open_unreachable_addon():
+    saved_url = app.BASE_URL
+    try:
+        app.BASE_URL = "http://127.0.0.1:1"
+        result = nt8.nt_editor_open()
+    finally:
+        app.BASE_URL = saved_url
+    assert result == {"error": app.NOT_REACHABLE}
+
+
+def test_compile_f5_without_an_editor_points_at_nt_editor_open():
+    saved = tools_local._find_windows
+    try:
+        tools_local._find_windows = lambda *_a, **_k: []
+        result = nt8.nt_compile_f5()
+    finally:
+        tools_local._find_windows = saved
+    assert result["ok"] is False and "nt_editor_open" in result["error"], result

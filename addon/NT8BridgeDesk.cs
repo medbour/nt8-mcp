@@ -14,6 +14,7 @@
 //   POST /desk/cancelOrphans      cancel them all on ONE account (optionally one instrument)
 //   POST /desk/gridRemove         remove a disabled, dead grid row this AddOn did not start
 //   POST /desk/gridEnable         re-enable an existing grid row, only if it is in the allowlist file
+//   POST /desk/gridDisable        disable an existing grid row and KEEP it (no remove, no flatten, no cancel)
 //
 // "Alive" is judged by the strategy Id, over every instance in StrategyBase.All: NinjaTrader runs a
 // CLONE that shares the Id (see NT8BridgeStrategyRun.cs), so the instance a grid row or an order points
@@ -54,6 +55,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (seg[1] == "cancelOrphans") return Ord_Guarded("/desk/cancelOrphans", "desk.cancelOrphans", body, ref status, Desk_CancelOrphans);
 			if (seg[1] == "gridRemove") return Ord_Guarded("/desk/gridRemove", "desk.gridRemove", body, ref status, Desk_GridRemove);
 			if (seg[1] == "gridEnable") return Ord_Guarded("/desk/gridEnable", "desk.gridEnable", body, ref status, Desk_GridEnable);
+			if (seg[1] == "gridDisable") return Ord_Guarded("/desk/gridDisable", "desk.gridDisable", body, ref status, Desk_GridDisable);
 			return null;
 		}
 
@@ -618,6 +620,131 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("accountObserved", Q(observed)), P("plan", planJson), P("auditLog", Q(Ord_AuditPath())),
 				P("note", Q("`ok` means the enable was dispatched and the instance reads an active state, never that "
 					+ "it trades: only \"Realtime\" is running. Re-read GET /strategies/running.")));
+		}
+
+		/// <summary>The row's account-side picture for the plan and the answer: the grid Enabled flag, the
+		/// most alive State over its Id, the account's position and live orders in the row's instrument.
+		/// `text` is the same in plan form.</summary>
+		private static string Desk_RowState(Ord_Gate g, string instrument, bool enabled, string state, out string text)
+		{
+			string posError, ordError;
+			Ord_Pos pos = Ord_Position(g.Account, instrument, out posError);
+			var ids = Ord_WorkingOf(g.Account, instrument, out ordError)
+				.Select(o => Ord_SafeText(() => o.OrderId) ?? "?").OrderBy(x => x, StringComparer.Ordinal).ToList();
+			text = "ENABLED=" + (enabled ? "true" : "false") + "|STATE=" + (state ?? "unreadable")
+				+ "|POSITION=" + (posError != null ? "unreadable"
+					: (pos.Side ?? "flat") + " " + pos.Quantity.ToString(CultureInfo.InvariantCulture))
+				+ "|WORKING=" + (ordError != null ? "unreadable" : (ids.Count == 0 ? "none" : string.Join(" ", ids.ToArray())));
+			return Obj(
+				P("enabled", enabled ? "true" : "false"),
+				P("state", Q(state)),
+				P("position", posError != null ? "null" : Obj(P("side", Q(pos.Side)), P("quantity", I(pos.Quantity)),
+					P("averagePrice", pos.Side == null ? "null" : D(pos.AveragePrice)))),
+				P("positionError", Q(posError)),
+				P("flat", posError != null ? "null" : (pos.Side == null ? "true" : "false")),
+				P("workingOrders", ordError != null ? "null" : Arr(ids.Select(Q))),
+				P("workingOrdersError", Q(ordError)));
+		}
+
+		/// <summary>POST /desk/gridDisable {account, strategyId}. Disables ONE existing row with the grid's
+		/// own StrategyDisable, as unticking Enabled does, and LEAVES THE ROW IN THE GRID so gridEnable can
+		/// turn it back on. It does not remove, flatten or cancel anything itself (NinjaTrader's own
+		/// CancelEntriesOnStrategyDisable option still applies). Same gates as gridEnable: the order door,
+		/// and (strategy, account, instrument) in the allowlist. A row that is already off answers ok with
+		/// alreadyDisabled and nothing is dispatched.</summary>
+		private static string Desk_GridDisable(Ord_Gate g)
+		{
+			Ord_Call call = g.Call;
+			string blocked = Sr_Blocked();
+			if (blocked != null) return Ord_Err(call, 501, "notAvailable", blocked);
+			long id = Desk_Id(g.Body);
+			string idText = id.ToString(CultureInfo.InvariantCulture);
+
+			string legsError;
+			var legs = Desk_Legs(out legsError);
+			if (legs == null) return Ord_Err(call, 403, "noAllowlist", legsError + " — no file means no grid disable");
+
+			Window cc; List<Desk_Row> rows;
+			string bad = Desk_Rows(call, out cc, out rows);
+			if (bad != null) return bad;
+			Desk_Row row;
+			bad = Desk_Target(g, rows, id, out row);
+			if (bad != null) return bad;
+
+			var leg = legs.FirstOrDefault(l => (Desk_Same(l.Strategy, row.Type) || Desk_Same(l.Strategy, row.Name))
+				&& Desk_Same(l.Account, row.Account) && Desk_Same(l.Instrument, row.Instrument));
+			if (leg == null)
+				return Ord_Err(call, 403, "notAllowlisted", "(" + (row.Type ?? "?") + ", " + row.Account + ", "
+					+ (row.Instrument ?? "?") + ") is not in the allowlist " + Desk_LegsPath());
+
+			string st;
+			Desk_IdStates(Desk_All()).TryGetValue(id, out st);
+			string beforeText;
+			string before = Desk_RowState(g, row.Instrument, row.Enabled, st, out beforeText);
+			if (!row.Enabled && !Desk_Active(st))
+				return Ord_Ok(call, "alreadyDisabled", "grid row " + idText + " is already disabled (state "
+					+ (st ?? "unreadable") + "); nothing dispatched",
+					P("ok", "true"), P("dryRun", "false"), P("alreadyDisabled", "true"), P("strategyId", Q(idText)),
+					P("before", before), P("after", before));
+
+			string plan = "desk.gridDisable|ACCOUNT=" + g.AccountName + "|ID=" + idText
+				+ "|STRATEGY=" + (row.Type ?? "?") + "|NAME=" + (row.Name ?? "?") + "|INSTRUMENT=" + (row.Instrument ?? "?")
+				+ "|" + beforeText + "|ALLOW=" + leg.Strategy + "/" + leg.Account + "/" + leg.Instrument
+				+ "|KEEPROW|NOFLATTEN|" + g.Caps.Text;
+			string planJson = Obj(
+				P("account", Q(g.AccountName)), P("strategyId", Q(idText)), P("strategy", Q(row.Type)),
+				P("name", Q(row.Name)), P("instrument", Q(row.Instrument)), P("before", before),
+				P("allowlist", Q(Desk_LegsPath())),
+				P("removesRow", "false"), P("flattens", "false"), P("cancelsOrders", "false"));
+			string gate = Ord_Approve(g, plan, planJson, "disable grid row " + idText, null);
+			if (gate != null) return gate;
+
+			// NinjaTrader runs a clone with the same Id: disable the live one, as /strategy/stop does.
+			var target = Sr_Live(row.Strat);
+			try
+			{
+				cc.Dispatcher.BeginInvoke(DispatcherPriority.Normal, (Action)(() =>
+				{
+					try { Sr_Disable.Invoke(null, new object[] { target }); }
+					catch (Exception ex) { Log("/desk/gridDisable: " + Deep(ex)); }
+				}));
+			}
+			catch (Exception ex)
+			{
+				return Ord_Err(call, 500, "disableFailed", "the disable could not be dispatched (" + Deep(ex)
+					+ ") — the row is unchanged; untick Enabled in the Control Center by hand");
+			}
+
+			// Wait for the Id to leave Configure..Realtime AND the row's Enabled flag to clear.
+			string stAfter = st;
+			Desk_Row rowAfter = null;
+			bool gridRead = false;
+			var w = cc;
+			var until = DateTime.UtcNow.AddMilliseconds(Sr_SettleMs);
+			while (true)
+			{
+				System.Threading.Thread.Sleep(Sr_PollMs);
+				string s2;
+				stAfter = Desk_IdStates(Desk_All()).TryGetValue(id, out s2) ? s2 : null;
+				var again = Ui(w.Dispatcher, () => Desk_GridRows(w), Ws_GridTimeout, "ControlCenter");
+				gridRead = again != null;
+				rowAfter = again == null ? null : again.FirstOrDefault(r => r.Id == id);
+				if ((!Desk_Active(stAfter) && rowAfter != null && !rowAfter.Enabled) || DateTime.UtcNow >= until) break;
+			}
+			bool enabledAfter = rowAfter == null || rowAfter.Enabled;
+			string afterText;
+			string after = Desk_RowState(g, row.Instrument, enabledAfter, stAfter, out afterText);
+			bool ok = rowAfter != null && !enabledAfter && !Desk_Active(stAfter);
+			call.Status = ok ? 200 : 502;
+			call.Outcome = ok ? "rowDisabled" : "rowDisableUnverified";
+			call.Detail = "grid row " + idText + ": " + beforeText + " -> " + afterText + "; NOT flattened";
+			return Obj(
+				P("ok", ok ? "true" : "false"), P("dryRun", "false"), P("alreadyDisabled", "false"),
+				P("strategyId", Q(idText)), P("stillInGrid", rowAfter != null ? "true" : (gridRead ? "false" : "null")),
+				P("before", before), P("after", after), P("plan", planJson), P("auditLog", Q(Ord_AuditPath())),
+				P("note", Q("`ok` means the row reads Enabled=false, is still in the grid, and no instance with its Id "
+					+ "is in Configure..Realtime. Nothing was flattened or cancelled by this call: read `after` for "
+					+ "a position or working orders left on the account. Re-enable with /desk/gridEnable.")));
 		}
 	}
 }

@@ -57,9 +57,15 @@ def nt_drawings(chart: str = "first"):
 
 @mcp.tool(name="nt_chart_reload")
 def nt_chart_reload(chart: str = "first"):
-    """Reload NinjaScript on ONE chart (same as right-click > Reload NinjaScript) — not the assembly, which
-    is nt_reload_assembly. Precondition: AddOn running."""
-    return _addon_post(f"/chart/{quote(chart)}/reload")
+    """Reload NinjaScript on ONE chart — NinjaTrader's own Reload NinjaScript command, run inside the
+    AddOn; no menu or dialog is shown. Not the assembly, which is nt_reload_assembly. Returns what was
+    OBSERVED, never a bare ok: `reloaded` is true when a script instance on the chart was replaced or
+    changed state (null when the chart has no NinjaScript), with `before` / `after` [{name, state,
+    newInstance}], `statesSeen` and `settled`. Refused (409) when the chart carries an enabled strategy
+    (a reload restarts it), while a modal message box is open, or when the command cannot execute.
+    Precondition: AddOn running."""
+    # The AddOn watches the chart for up to ~10 s after the command.
+    return _addon_post(f"/chart/{quote(chart)}/reload", _timeout=max(app.HTTP_TIMEOUT, 30))
 
 
 @mcp.tool(name="nt_output_window")

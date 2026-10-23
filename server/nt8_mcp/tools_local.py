@@ -96,13 +96,43 @@ def _folder_for(src_text: str) -> str:
     return "Indicators"
 
 
+def _not_pushed(files: list[str]) -> list[str]:
+    """Opt-in (env NT8_MCP_REQUIRE_PUSHED=1): why each file may not go live: not in a git repo, not
+    committed, or its branch not pushed. For a desk where only pushed code may reach the live charts."""
+    if os.environ.get("NT8_MCP_REQUIRE_PUSHED") != "1":
+        return []
+    git = lambda d, *a: subprocess.run(["git", "-C", d, *a], capture_output=True, text=True)
+    problems, checked = [], set()
+    for f in files:
+        d = os.path.dirname(os.path.abspath(f))
+        top = git(d, "rev-parse", "--show-toplevel")
+        if top.returncode:
+            problems.append(f"{f}: not in a git repo")
+            continue
+        if git(d, "status", "--porcelain", "--", os.path.abspath(f)).stdout.strip():
+            problems.append(f"{f}: not committed")
+        root = top.stdout.strip()
+        if root not in checked:
+            checked.add(root)
+            ahead = git(root, "rev-list", "--count", "@{u}..HEAD")
+            if ahead.returncode:
+                problems.append(f"{root}: branch has no upstream to push to")
+            elif int(ahead.stdout.strip() or 0):
+                problems.append(f"{root}: {ahead.stdout.strip()} commit(s) not pushed")
+    return problems
+
+
 @mcp.tool(name="nt_install")
 def nt_install(files: list[str]) -> list[dict]:
     """Copy .cs files into NT8's Custom/<AddOns|Strategies|SuperDomColumns|Indicators> (folder decided by class
     content). If [NinjaScriptProperty]/AddPlot() counts changed vs the installed copy, deletes it and recopies
     after a pause (NT8's folder watcher otherwise glues a stale generated region onto it), then strips that
     region so F5 regenerates it clean. Does not compile — call nt_compile after. Precondition: NT8 not fighting
-    you for the file (close it in the NinjaScript Editor first)."""
+    you for the file (close it in the NinjaScript Editor first). With NT8_MCP_REQUIRE_PUSHED=1 it refuses
+    files that are not committed and pushed (nt_check first, then commit, push, install)."""
+    problems = _not_pushed(files)
+    if problems:
+        return [{"error": "not installed: commit and push first", "problems": problems}]
     results = []
     pending: list[tuple[str, str, str]] = []  # (src, dst, name)
     for f in files:
@@ -152,6 +182,9 @@ def nt_install_addon() -> dict:
     files = sorted(str(p) for p in ADDON_DIR.glob("*.cs"))
     if not files:
         return {"ok": False, "error": f"no .cs files in {ADDON_DIR}"}
+    problems = _not_pushed(files)
+    if problems:
+        return {"ok": False, "error": "not installed: commit and push first", "problems": problems}
 
     # Refuse rather than scatter: a partial that does not classify as an AddOn would land in
     # Custom\Indicators while install-addon.ps1 puts it in Custom\AddOns -> CS0111 -> dead build.
@@ -260,7 +293,7 @@ def nt_compile_f5(timeout_s: int = 240) -> dict:
     where editor_shot is a screenshot of the editor window (likely showing a compile error)."""
     windows = _find_windows("NinjaScript Editor")
     if not windows:
-        return {"ok": False, "error": "No NinjaScript Editor window found. Open Control Center > New > NinjaScript Editor."}
+        return {"ok": False, "error": "No NinjaScript Editor window found. Call nt_editor_open first (or open Control Center > New > NinjaScript Editor)."}
     hwnd = windows[0][0]
 
     before_mtime = os.path.getmtime(NT_CUSTOM_DLL) if os.path.exists(NT_CUSTOM_DLL) else None

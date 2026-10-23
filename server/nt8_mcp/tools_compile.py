@@ -236,3 +236,16 @@ def nt_reload_assembly(timeout_s: int = RELOAD_TIMEOUT_S) -> dict:
     reload itself, so the answer often comes from compile_last.json (`source`) — that is normal, not an
     error. Use nt_compile when you only want to know whether the tree builds."""
     return compile_via_addon(reload=True, timeout_s=timeout_s)
+
+
+EDITOR_OPEN_TIMEOUT_S = 30  # the AddOn waits up to 10 s for the UI thread and 10 s for the window
+
+
+@mcp.tool(name="nt_editor_open")
+def nt_editor_open() -> dict:
+    """Open NinjaTrader's NinjaScript Editor window (`POST /editor/open`), exactly as Control Center >
+    New > NinjaScript Editor does, so nt_compile_f5 has an editor to press F5 in. If an editor is already
+    open it does nothing. It changes nothing else: no compile, no save, no reload, no window closed.
+    Returns {ok, alreadyOpen, windowTitle}; the AddOn checks the open windows after the menu handler runs,
+    so ok:true means an editor window was really seen. Needs NinjaTrader running with the AddOn loaded."""
+    return app._addon_post("/editor/open", _timeout=EDITOR_OPEN_TIMEOUT_S)

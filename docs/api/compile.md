@@ -111,6 +111,7 @@ loaded" — there is no `ok` field at all, so nothing can read it as a failed bu
 | `nt_compile(timeout_s=120)` | MCP tool | check-only, via `compile_via_addon(reload=False)`; falls back to `nt_compile_f5` (`tools_local.py`) when the AddOn does not answer `/health` at all. Takes **no** reload flag, by design: a validate step must not be able to disrupt a live session by flipping an argument |
 | `nt_reload_assembly(timeout_s=240)` | MCP tool | the separate reload tool, via `compile_via_addon(reload=True)`. No `force` argument is exposed — the AddOn's 409 while `AnyLiveConnected()` cannot be bypassed from here |
 | `compile_via_addon(reload=False, force=False, timeout_s=None)` | plain function | the full capability behind both tools above |
+| `nt_editor_open()` | MCP tool | `POST /editor/open`, see *Opening the editor* below |
 
 Timeouts default to 120 s for a compile and 240 s for a reload (`app.HTTP_TIMEOUT` is 5 s and is
 far too short, so this module makes its own request).
@@ -128,3 +129,25 @@ One compile at a time: the module takes `Compile_gate` with `Monitor.TryEnter` a
 request with `409` rather than queueing it, because a compile holds that lock for 20-30 s and the
 core's `Route` must not block. The module subscribes to no event and starts no thread, so it has no
 `Stop_Compile`.
+
+## Opening the editor
+
+`POST /editor/open` (`addon/NT8Bridge.Editor.cs`, MCP tool `nt_editor_open`) opens the NinjaScript
+Editor so the F5 path (`nt_compile_f5`) has a window to press F5 in.
+
+- Mechanism: `ControlCenter.OnNinjaScriptEditor(object, RoutedEventArgs)`, the Click handler of
+  Control Center > New > NinjaScript Editor (internal, resolved by reflection; `/compat` key
+  `ControlCenter.OnNinjaScriptEditor`), invoked on the Control Center's dispatcher with a
+  `MenuItem.ClickEvent` args object. The handler's own exception is caught on the UI thread.
+- Verified, not claimed: after the call the AddOn polls the window registry for a
+  `NinjaTrader.Gui.NinjaScript.Editor.EditorView` with a live handle for up to 10 s.
+- Idempotent: an editor already open answers `{"ok":true,"alreadyOpen":true,"windowTitle":..}` and nothing runs.
+- It opens a window and nothing else: no compile, no save, no close.
+
+| Status | When |
+|---|---|
+| 200 | `{ok:true, alreadyOpen, windowTitle}` |
+| 409 | another `/editor/open` is running |
+| 503 | no Control Center window, or the handler did not resolve |
+| 504 | the handler ran but no editor window appeared within 10 s (or the Control Center thread did not answer) |
+| 500 | the handler threw; the message is in `error` and in `/log` |

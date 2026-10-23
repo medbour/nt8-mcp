@@ -2,12 +2,13 @@
 # (https://github.com/eman007/cli-nt-bridge), Copyright (c) 2026 eman007,
 # MIT License. The full notice is in NOTICE at the repository root.
 # (Derived: the `offscreen` heuristic and its minimized exclusion, nt8bridge/windows.py:39-59.)
-"""Desktop tools: the loaded workspace, the Control Center strategy grid, window screenshots.
+"""Desktop tools: the loaded workspace, the Control Center strategy grid, window screenshots,
+and workspace switch / open / close / save-as.
 
 Thin wrappers over the AddOn's HTTP API on :7891 (contract: ../../docs/api/workspace.md).
-All three are reads; the only thing written anywhere is one PNG file. Nothing here enables,
-disables, starts or stops a strategy, and nothing here restores, fronts, moves or resizes a
-window.
+The first three are reads; the only thing they write is one PNG file. The four workspace
+operations call NinjaTrader's own workspace methods inside the AddOn: no menu, no dialog, no
+mouse, and nothing is ever deleted. Nothing here enables, disables, starts or stops a strategy.
 """
 
 import os
@@ -20,6 +21,9 @@ from nt8_mcp.app import Image, _addon_get, _addon_post, mcp
 # has a natural per-call knob like a coverage scan does. Raise further if a slower desktop needs it.
 _WORKSPACE_BUDGET_S = 65   # one Ui() hop per window, each bounded at 5s on the AddOn side
 _RUNNING_BUDGET_S = 15     # one Ui() hop bounded at Ws_GridTimeout (10s) on the AddOn side
+# Opening a workspace builds every window in it on NinjaTrader's side, then the AddOn re-reads
+# for up to ~5 s; a started UI call is waited for, so the budget covers a heavy workspace.
+_WORKSPACE_OP_BUDGET_S = 120
 
 # Windows parks a minimized window at (-32000, -32000) — well inside the "lost" range below — while
 # it still reports as a normal window. Without the exclusion every minimized window is a false
@@ -123,3 +127,63 @@ def nt_window_shot(window: str = "", chart: str = "", hwnd: int = 0, path: str =
     if not isinstance(result, dict) or not result.get("path"):
         return result  # {"error": ...}
     return Image(path=result["path"])
+
+
+_WS_NOTE = ("No UI is shown: the AddOn calls NinjaTrader's own WorkspaceOptions methods on the "
+            "Control Center's thread, opens no menu and no dialog. Nothing is deleted.")
+
+
+def _ws_op(op: str, body: dict) -> dict:
+    return _addon_post(f"/workspace/{op}", body,
+                       _timeout=max(app.HTTP_TIMEOUT, _WORKSPACE_OP_BUDGET_S))
+
+
+@mcp.tool(name="nt_workspace_switch")
+def nt_workspace_switch(name: str) -> dict:
+    """Make an OPEN NinjaTrader workspace the active one (WorkspaceOptions.SwitchToWorkspace).
+    No UI is shown: no menu, no dialog, no mouse; nothing is deleted. A workspace that is not open is
+    refused (409) — use nt_workspace_open. Refused (409) while a modal message box is open. Returns
+    the read-back after the call: {ok, observed, op, name, alreadyActive, active, open,
+    standingModal}; `observed`/`ok` are true only when the active workspace read back is `name`.
+    Precondition: NT8 open with the AddOn running."""
+    return _ws_op("switch", {"name": name})
+
+
+@mcp.tool(name="nt_workspace_open")
+def nt_workspace_open(name: str, activate: bool = True) -> dict:
+    """Open a workspace FILE from NinjaTrader's workspaces folder (WorkspaceOptions.OpenWorkspace),
+    also one written after NinjaTrader started that its Workspaces menu does not list. `name` is
+    the file name without `.xml`; a path or separator is refused (400), a missing file is 404.
+    activate=True makes it the active workspace. Already open: a switch when activate=True, else
+    nothing. No UI is shown: no menu, no dialog, no mouse; nothing is deleted. Refused (409) while a
+    modal message box is open. Returns the read-back: {ok, observed, name, alreadyOpen, returned,
+    addedToSavedList, active, open, standingModal}. Precondition: NT8 open with the AddOn running."""
+    return _ws_op("open", {"name": name, "activate": activate})
+
+
+@mcp.tool(name="nt_workspace_close")
+def nt_workspace_close(name: str, save: bool = False) -> dict:
+    """Close an open workspace with no click needed (WorkspaceOptions.CloseWorkspace,
+    removing=False: the file stays on disk, nothing is deleted). NinjaTrader's own "Do you want to
+    save workspace '<name>'?" prompt is answered by the AddOn inside NinjaTrader: No for save=False,
+    Yes for save=True (Yes is NinjaTrader's save). Cancel is never pressed and no other dialog is
+    touched. No UI is driven from outside: no menu, no mouse, no keys. Refused (409) when it is the
+    only open workspace, when the Strategies grid files an enabled or running strategy under it, or
+    while a modal message box is already open; 503 when the grid cannot be read. 504 with
+    `standingModal` when a prompt could not be found or answered in ~10 s: it is left for the user.
+    Returns the read-back: {ok, observed, name, prompt ("answered No" / "answered Yes" / "none"),
+    saved, returned, wasActive, active, open, standingModal}; `observed` = the name is gone from the
+    open list. Precondition: NT8 open with the AddOn running."""
+    return _ws_op("close", {"name": name, "save": save})
+
+
+@mcp.tool(name="nt_workspace_save_as")
+def nt_workspace_save_as(name: str, new_name: str, overwrite: bool = False) -> dict:
+    """Save an OPEN workspace under a new name with no dialog (WorkspaceOptions.SaveWorkspaceAs).
+    An existing `new_name.xml` is refused (409) unless overwrite=True; a `new_name` that is open is
+    always refused. No UI is shown: no menu, no dialog, no mouse; nothing is deleted. Like
+    NinjaTrader's own Save As it RENAMES the open workspace: afterwards `new_name` is open and
+    `name` is not (`name.xml` stays on disk; `renamed` says so). Re-open `name` if you need both.
+    Returns {ok, observed, name, newName, file, overwrote, renamed, returned, active, open, standingModal};
+    `observed` = the file was written by this call. Precondition: NT8 open with the AddOn running."""
+    return _ws_op("saveAs", {"name": name, "newName": new_name, "overwrite": overwrite})
