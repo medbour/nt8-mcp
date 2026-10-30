@@ -733,10 +733,16 @@ namespace NinjaTrader.NinjaScript.AddOns
 					try
 					{
 						var win = w;
-						string t = Ui(win.Dispatcher, () => TitleOf(win), TimeSpan.FromMilliseconds(500), ty);
+						object[] st = Ui(win.Dispatcher, () => new object[] { TitleOf(win), win.IsVisible },
+							TimeSpan.FromMilliseconds(500), ty);
+						// A message box that is not visible (closed, or created and never shown)
+						// stands over nothing: skip it. Without this a stale instance blocked every
+						// chart call forever while no dialog was on screen.
+						if (!(bool)st[1]) continue;
+						string t = (string)st[0];
 						if (!string.IsNullOrEmpty(t)) return t;
 					}
-					catch { }
+					catch { }		// its thread did not answer in time: a real modal pumps its own frame, so assume one
 					return ty;
 				}
 			}
